@@ -185,7 +185,9 @@ def _capture_from_results(results_file: Path, args) -> None:
             async with sem:
                 pic = await screenshot.capture(url, images_dir, timeout)
             if pic:
-                pics.append((url, f"images/{Path(pic).name}"))
+                entry = (url, f"images/{Path(pic).name}")
+                if entry not in pics:
+                    pics.append(entry)
             done += 1
             if bar.total is None:
                 bar.total = len(urls)
@@ -205,9 +207,10 @@ def _capture_from_results(results_file: Path, args) -> None:
 
     t0 = time.monotonic()
     shots = asyncio.run(_run())
+    actual_shots = len(list(images_dir.glob("*.jpg")))
     print(
         _c(
-            f"[done] capture: {shots}/{len(urls)} screenshot(s) taken in "
+            f"[done] capture: {actual_shots}/{len(urls)} screenshot(s) taken in "
             f"{time.monotonic() - t0:.1f}s",
             "32",
         )
