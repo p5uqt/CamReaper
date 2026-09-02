@@ -52,12 +52,14 @@ class MockRTSPServer:
         silent_after=None,
         open_route=None,
         routes_404=None,
+        server_header="Mock",
     ):
         self.mode = mode
         self.valid_cred = valid_cred
         self.silent_after = silent_after
         self.open_route = open_route
         self.routes_404 = routes_404 or ()
+        self.server_header = server_header
         self.host = "127.0.0.1"
         self.port = None
         self.server = None
@@ -210,7 +212,7 @@ class MockRTSPServer:
     async def _send(self, writer, code, body=""):
         resp = (
             _status_line(code)
-            + "Server: Mock\r\n"
+            + f"Server: {self.server_header}\r\n"
             + 'WWW-Authenticate: Digest realm="r", nonce="n1"\r\n'
             + f"Content-Length: {len(body)}\r\n"
             + "\r\n"
@@ -221,7 +223,8 @@ class MockRTSPServer:
 
 
 async def make_server(
-    mode, valid_cred="admin:admin", silent_after=None, open_route=None, routes_404=None
+    mode, valid_cred="admin:admin", silent_after=None, open_route=None,
+    routes_404=None, server_header="Mock",
 ):
     srv = MockRTSPServer(
         mode=mode,
@@ -229,6 +232,7 @@ async def make_server(
         silent_after=silent_after,
         open_route=open_route,
         routes_404=routes_404,
+        server_header=server_header,
     )
     await srv.start()
     return srv

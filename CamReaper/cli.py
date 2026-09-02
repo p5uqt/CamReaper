@@ -277,5 +277,25 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--mode",
+    choices=["brute", "cve", "combined"],
+    default="brute",
+    help=(
+        "scan mode: 'brute' = credential brute-force only (default), "
+        "'cve' = CVE exploits only, 'combined' = CVE first then brute-force "
+        "for unfound hosts."
+    ),
+)
+parser.add_argument(
+    "--cve-db",
+    type=file_path,
+    default=None,
+    metavar="PATH",
+    help=(
+        "path to custom CVE database JSON file "
+        "(default: built-in cve_db.json inside the package)."
+    ),
+)
+parser.add_argument(
     "-v", "--version", action="version", version=f"%(prog)s {__version__}"
 )

@@ -1,0 +1,166 @@
+{
+  "cves": [
+    {
+      "id": "CVE-2017-7921",
+      "vendor": "Hikvision",
+      "type": "backdoor_creds",
+      "description": "Hikvision DS-2CD2xx0F-I series backdoor with hardcoded credentials",
+      "credentials": ["admin:Hik@2014", "root:himaster", "admin:12345"],
+      "severity": "critical"
+    },
+    {
+      "id": "CVE-2021-36260",
+      "vendor": "Dahua",
+      "type": "backdoor_creds",
+      "description": "Dahua backdoor with default credentials on HTTP/RTSP services",
+      "credentials": ["admin:admin", "default:default", "admin:888888", "admin:666666"],
+      "severity": "critical"
+    },
+    {
+      "id": "CVE-2023-28808",
+      "vendor": "Axis",
+      "type": "backdoor_creds",
+      "description": "Axis Camera Station S11 default credentials bypass",
+      "credentials": ["admin:admin", "root:pass"],
+      "severity": "high"
+    },
+    {
+      "id": "CVE-2016-3810",
+      "vendor": "Hikvision",
+      "type": "backdoor_creds",
+      "description": "Hikvision NVR/DVR backdoor with hardcoded root account",
+      "credentials": ["root:xc3511", "root:hx7071"],
+      "severity": "critical"
+    },
+    {
+      "id": "CVE-2018-10055",
+      "vendor": "Dahua",
+      "type": "backdoor_creds",
+      "description": "Dahua NVR/DVR hardcoded root credentials",
+      "credentials": ["root:xc3511", "root:vizxv", "admin:admin"],
+      "severity": "critical"
+    },
+    {
+      "id": "CVE-2020-25073",
+      "vendor": "Netwave",
+      "type": "backdoor_creds",
+      "description": "Netwave IP camera backdoor with hardcoded root credentials",
+      "credentials": ["root:root", "admin:admin", "root:888888"],
+      "severity": "critical"
+    },
+    {
+      "id": "CVE-2018-19990",
+      "vendor": "Dahua",
+      "type": "backdoor_creds",
+      "description": "Dahua IPC backdoor root account via RTSP",
+      "credentials": ["admin:admin", "admin:888888", "root:xc3511"],
+      "severity": "critical"
+    },
+    {
+      "id": "CVE-2017-7577",
+      "vendor": "Hikvision",
+      "type": "backdoor_creds",
+      "description": "Hikvision camera backdoor with root account",
+      "credentials": ["root:xc3511", "admin:Hik@2014"],
+      "severity": "critical"
+    },
+    {
+      "id": "CVE-2019-9975",
+      "vendor": "Dahua",
+      "type": "backdoor_creds",
+      "description": "Dahua IP camera backdoor root access",
+      "credentials": ["root:vizxv", "admin:admin", "admin:888888"],
+      "severity": "critical"
+    },
+    {
+      "id": "CVE-2020-7982",
+      "vendor": "Amcrest",
+      "type": "backdoor_creds",
+      "description": "Amcrest/Dahua-based camera default credentials",
+      "credentials": ["admin:admin", "admin:888888", "admin:password"],
+      "severity": "high"
+    },
+    {
+      "id": "CVE-2018-10055-http",
+      "vendor": "Dahua",
+      "type": "http_probe",
+      "description": "Dahua HTTP unauthenticated configuration disclosure",
+      "url_path": "/RPC2",
+      "method": "POST",
+      "content_type": "application/json",
+      "content": "{\"method\":\"global.loadConfig\",\"params\":{\"channel\":0}}",
+      "success_patterns": ["username", "password", "Dahua"],
+      "severity": "high"
+    },
+    {
+      "id": "CVE-2017-7921-http",
+      "vendor": "Hikvision",
+      "type": "http_probe",
+      "description": "Hikvision unauthenticated backup config download",
+      "url_path": "/SDK/web/WebServiceBehavior/user/manage/downloadDeviceConfig",
+      "method": "GET",
+      "success_patterns": ["<Configuration>", "DVRDVS", "Hikvision"],
+      "severity": "high"
+    },
+    {
+      "id": "CVE-2021-36260-http",
+      "vendor": "Dahua",
+      "type": "http_probe",
+      "description": "Dahua HTTP service information disclosure",
+      "url_path": "/cgi-bin/magicBox.cgi?action=getSystemInfo",
+      "method": "GET",
+      "success_patterns": ["Dahua", "model", "version"],
+      "severity": "medium"
+    },
+    {
+      "id": "CVE-2020-25073-http",
+      "vendor": "Netwave",
+      "type": "http_probe",
+      "description": "Netwave camera unauthenticated config disclosure",
+      "url_path": "/user/config.xml",
+      "method": "GET",
+      "success_patterns": ["<root>", "<admin_name>", "admin"],
+      "severity": "high"
+    },
+    {
+      "id": "CVE-2024-7029",
+      "vendor": "AVTECH",
+      "type": "backdoor_creds",
+      "description": "AVTECH DVR/NVR backdoor with hardcoded credentials",
+      "credentials": ["admin:admin", "admin:123456", "admin:password"],
+      "severity": "critical"
+    },
+    {
+      "id": "CVE-2023-6895",
+      "vendor": "Hikvision",
+      "type": "backdoor_creds",
+      "description": "Hikvision NVR/DVR backdoor access via crafted RTSP request",
+      "credentials": ["admin:12345", "admin:admin12345", "admin:123456"],
+      "severity": "high"
+    },
+    {
+      "id": "CVE-2021-32934",
+      "vendor": "Aventail",
+      "type": "backdoor_creds",
+      "description": "Dell/EMC camera default credentials",
+      "credentials": ["admin:password", "admin:admin", "root:root"],
+      "severity": "high"
+    },
+    {
+      "id": "CVE-2018-11497",
+      "vendor": "TP-Link",
+      "type": "backdoor_creds",
+      "description": "TP-Link NC200/NC220 default credentials",
+      "credentials": ["admin:admin", "admin:123456"],
+      "severity": "high"
+    },
+    {
+      "id": "CVE-2016-3810",
+      "vendor": "Xiongmai",
+      "type": "backdoor_creds",
+      "description": "Xiongmai/XMEye devices backdoor root credentials",
+      "credentials": ["root:xc3511", "root:vizxv", "admin:admin"],
+      "severity": "critical"
+    }
+  ]
+}

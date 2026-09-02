@@ -22,6 +22,9 @@ FAILED_FILE: Optional[Path] = (
 NO_AUTH_FILE: Optional[Path] = (
     None  # set by __main__ to enable no-matching-credential logging
 )
+CVE_LOG_FILE: Optional[Path] = (
+    None  # set by __main__ to enable CVE exploit logging
+)
 _lock = asyncio.Lock()
 # path -> handle of the currently open file, kept across writes.
 _handles: Dict[Path, object] = {}
@@ -202,6 +205,18 @@ async def record_no_auth(ip: str, port: int) -> None:
     await _append(NO_AUTH_FILE, f"{ip} {port}\n")
 
 
+async def record_cve_test(ip: str, port: int, cve_id: str, success: bool) -> None:
+    """Log a CVE exploit attempt: 'ip port CVE-ID SUCCESS|FAIL'.
+
+    No-op unless ``CVE_LOG_FILE`` is configured, so the default run pays
+    nothing.  The write is buffered like every other report writer.
+    """
+    if CVE_LOG_FILE is None:
+        return
+    status = "SUCCESS" if success else "FAIL"
+    await _append(CVE_LOG_FILE, f"{ip} {port} {cve_id} {status}\n")
+
+
 async def record_gallery(url: str, pic_rel: str) -> None:
     """Append a gallery entry to index.html for a successful screenshot."""
     if HTML_FILE is None:
@@ -297,7 +312,7 @@ async def close_report_files() -> None:
     async with _lock:
         # Ensure every configured output file exists even if nothing was
         # buffered for it yet (buffering defers file creation to first flush).
-        for path in (RESULT_FILE, HTML_FILE, FAILED_FILE, NO_AUTH_FILE):
+        for path in (RESULT_FILE, HTML_FILE, FAILED_FILE, NO_AUTH_FILE, CVE_LOG_FILE):
             if path is not None:
                 try:
                     path.touch()
@@ -351,10 +366,12 @@ def write_summary(path: Path, stats: dict, elapsed: float = 0.0) -> None:
         "elapsed": round(elapsed, 1),
         "statistics": {
             k: stats.get(k, 0)
-            for k in ("checked", "found", "screenshots", "found_no_frame")
+            for k in ("checked", "found", "screenshots", "found_no_frame",
+                      "cve_found", "cve_tested")
         },
         "vendors": stats.get("vendors", {}),
         "ports": stats.get("ports", {}),
+        "mode": stats.get("mode", "brute"),
     }
     try:
         path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")

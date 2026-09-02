@@ -338,6 +338,11 @@ def main():
         report.NO_AUTH_FILE = no_auth_file
         report.NO_AUTH_FILE.touch()
 
+    # Optional CVE exploit log.
+    if args.mode in ("cve", "combined"):
+        report.CVE_LOG_FILE = report_folder / "cve_log.txt"
+        report.CVE_LOG_FILE.touch()
+
     # Optional checkpoint/resume support.  On a fresh checkpoint run every
     # CHECKPOINT_EVERY completed hosts (and at the end / on Ctrl+C) the current
     # stats are written to the JSON and the finished IPs appended to the
@@ -387,6 +392,30 @@ def main():
     ports = args.ports
     routes = _load_lines(args.routes)
     credentials = _load_lines(args.credentials)
+
+    # Load CVE database if scan mode requires it.
+    cve_db = None
+    if args.mode in ("cve", "combined"):
+        from CamReaper.cve import CVEDatabase
+
+        db_path = Path(args.cve_db) if args.cve_db else (
+            Path(__file__).parent / "cve_db.json"
+        )
+        if db_path.exists():
+            cve_db = CVEDatabase(db_path)
+            print(
+                _c(
+                    f"[info] CVE database: {db_path.name} "
+                    f"({len(cve_db.entries)} exploits, "
+                    f"{sum(len(e.credentials) for e in cve_db.entries if e.type == 'backdoor_creds')} backdoor creds)"
+                )
+            )
+        else:
+            if args.mode == "cve":
+                parser.error(f"CVE mode requires a valid database: {db_path}")
+            else:
+                print(_c(f"[warn] CVE database not found: {db_path}, skipping CVE stage", "33"))
+
     n_targets = count_targets(args.targets)
     if checked:
         total = max(n_targets - len(checked), 0)
@@ -394,7 +423,7 @@ def main():
         total = n_targets
     print(
         _c(
-            f"[info] targets={args.targets.name} ips={total}/{n_targets} ports={ports} "
+            f"[info] mode={args.mode} targets={args.targets.name} ips={total}/{n_targets} ports={ports} "
             f"routes={len(routes)} creds={len(credentials)}"
         )
     )
@@ -424,6 +453,8 @@ def main():
         failed_with_error=args.failed_with_error,
         no_auth_file=no_auth_file,
         route_parallel=args.route_parallel,
+        mode=args.mode,
+        cve_db=cve_db,
     )
 
     # Local mirror of the live stats; ``show`` copies the scanner's own dict here
@@ -435,6 +466,9 @@ def main():
         "found_no_frame": 0,
         "vendors": {},
         "ports": {},
+        "cve_found": 0,
+        "cve_tested": 0,
+        "mode": args.mode,
     }
     base = resumed_stats or {
         "checked": 0,
@@ -449,6 +483,8 @@ def main():
             "found": stats["found"] + base["found"],
             "screenshots": stats["screenshots"] + base["screenshots"],
             "found_no_frame": stats["found_no_frame"] + base["found_no_frame"],
+            "cve_found": stats["cve_found"],
+            "cve_tested": stats["cve_tested"],
         }
 
     # Compose the (possibly deduped) scan iterator.  The original targets Path is
@@ -475,7 +511,8 @@ def main():
         if checked is not None:
             checked.add(ip)
             pending_ips.append(ip)
-        for k in ("checked", "found", "screenshots", "found_no_frame"):
+        for k in ("checked", "found", "screenshots", "found_no_frame",
+                  "cve_found", "cve_tested"):
             stats[k] = current[k]
         stats["vendors"] = current["vendors"]
         stats["ports"] = current["ports"]

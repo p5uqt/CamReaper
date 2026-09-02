@@ -66,6 +66,9 @@ class Settings:
     host_timeout: float = 0.0  # 0 = unlimited; wall-clock cap for one host
     route_parallel: int = 8  # 0 = serial
     status_interval: float = 5.0  # seconds between live status callbacks
+    mode: str = "brute"  # "brute" | "cve" | "combined"
+    cve_db: object = None  # CVEDatabase instance or None
+    http_timeout: float = 5.0  # timeout for CVE HTTP probes
 
 
 async def _try_auth(client: RTSPClient, cred: str, route: str):
@@ -341,7 +344,25 @@ async def _handle_host(ip: str, s: Settings) -> list:
         live.close()
         return found
 
-    # ---- stage 3: brute-force credentials ----
+    # ---- stage 3: CVE exploits (vendor-specific backdoors & HTTP probes) ----
+    if s.mode in ("cve", "combined") and s.cve_db and vendor != "Generic":
+        from CamReaper.cve import run_cve_stage
+
+        cve_found = await run_cve_stage(
+            ip, live, vendor, s.cve_db, s.route_parallel, s.http_timeout,
+        )
+        if cve_found:
+            found.extend(cve_found)
+            live.close()
+            return found
+
+    # ---- stage 4: brute-force credentials ----
+    if s.mode == "cve":
+        # CVE-only mode: skip brute-force entirely.
+        live.close()
+        if not found:
+            await record_no_auth(ip, live.port)
+        return found
     attempts = 0
     transport_fails = 0
     need_fresh = False
@@ -471,6 +492,8 @@ async def run(iter_targets, s: Settings, on_counter=None, on_status=None) -> dic
         "found_no_frame": 0,  # confirmed stream whose capture returned no frame
         "vendors": {},  # vendor -> count of confirmed streams
         "ports": {},  # port -> count of confirmed streams
+        "cve_found": 0,  # streams found via CVE exploits
+        "cve_tested": 0,  # CVE exploits tested
     }
     # ip -> monotonic start time of the in-flight host pipeline, so the
     # watchdog can surface a stalled tail instead of a silent trickle.
