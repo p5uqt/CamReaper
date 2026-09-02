@@ -69,9 +69,11 @@ def test_write_summary(tmp_path):
         "found": 3,
         "screenshots": 2,
         "found_no_frame": 1,
-        "cve_found": 0,
-        "cve_tested": 0,
-    }
+            "cve_found": 0,
+            "cve_tested": 0,
+            "http_checked": 0,
+            "http_found": 0,
+        }
     assert data["vendors"] == {"Hikvision": 2, "Generic": 1}
     assert data["ports"] == {"554": 3}
     assert data["mode"] == "brute"

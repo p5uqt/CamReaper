@@ -343,6 +343,16 @@ def main():
         report.CVE_LOG_FILE = report_folder / "cve_log.txt"
         report.CVE_LOG_FILE.touch()
 
+    # Optional HTTP CVE-probe log (hosts with a vulnerable web panel but no
+    # live RTSP port).
+    if (
+        not args.no_http
+        and args.mode in ("cve", "combined")
+        and args.http_ports
+    ):
+        report.HTTP_CVE_FILE = report_folder / "http_cve.txt"
+        report.HTTP_CVE_FILE.touch()
+
     # Optional checkpoint/resume support.  On a fresh checkpoint run every
     # CHECKPOINT_EVERY completed hosts (and at the end / on Ctrl+C) the current
     # stats are written to the JSON and the finished IPs appended to the
@@ -455,6 +465,8 @@ def main():
         route_parallel=args.route_parallel,
         mode=args.mode,
         cve_db=cve_db,
+        http_ports=args.http_ports,
+        no_http=args.no_http,
     )
 
     # Local mirror of the live stats; ``show`` copies the scanner's own dict here
@@ -468,6 +480,8 @@ def main():
         "ports": {},
         "cve_found": 0,
         "cve_tested": 0,
+        "http_checked": 0,
+        "http_found": 0,
         "mode": args.mode,
     }
     base = resumed_stats or {
@@ -485,6 +499,8 @@ def main():
             "found_no_frame": stats["found_no_frame"] + base["found_no_frame"],
             "cve_found": stats["cve_found"],
             "cve_tested": stats["cve_tested"],
+            "http_checked": stats["http_checked"],
+            "http_found": stats["http_found"],
         }
 
     # Compose the (possibly deduped) scan iterator.  The original targets Path is
@@ -512,7 +528,7 @@ def main():
             checked.add(ip)
             pending_ips.append(ip)
         for k in ("checked", "found", "screenshots", "found_no_frame",
-                  "cve_found", "cve_tested"):
+                  "cve_found", "cve_tested", "http_checked", "http_found"):
             stats[k] = current[k]
         stats["vendors"] = current["vendors"]
         stats["ports"] = current["ports"]

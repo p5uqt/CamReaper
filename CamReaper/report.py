@@ -25,6 +25,9 @@ NO_AUTH_FILE: Optional[Path] = (
 CVE_LOG_FILE: Optional[Path] = (
     None  # set by __main__ to enable CVE exploit logging
 )
+HTTP_CVE_FILE: Optional[Path] = (
+    None  # set by __main__ to log HTTP CVE-probe hits (non-RTSP)
+)
 _lock = asyncio.Lock()
 # path -> handle of the currently open file, kept across writes.
 _handles: Dict[Path, object] = {}
@@ -217,6 +220,19 @@ async def record_cve_test(ip: str, port: int, cve_id: str, success: bool) -> Non
     await _append(CVE_LOG_FILE, f"{ip} {port} {cve_id} {status}\n")
 
 
+async def record_http_cve(ip: str, port: int, cve_id: str) -> None:
+    """Log an HTTP CVE-probe hit: 'ip port CVE-ID'.
+
+    Separate from ``record_cve_test`` because these are hosts whose web panel
+    is vulnerable but which expose NO live RTSP port - so they must never be
+    written into result.txt as a playable stream.  No-op unless
+    ``HTTP_CVE_FILE`` is configured.
+    """
+    if HTTP_CVE_FILE is None:
+        return
+    await _append(HTTP_CVE_FILE, f"{ip} {port} {cve_id}\n")
+
+
 async def record_gallery(url: str, pic_rel: str) -> None:
     """Append a gallery entry to index.html for a successful screenshot."""
     if HTML_FILE is None:
@@ -312,7 +328,8 @@ async def close_report_files() -> None:
     async with _lock:
         # Ensure every configured output file exists even if nothing was
         # buffered for it yet (buffering defers file creation to first flush).
-        for path in (RESULT_FILE, HTML_FILE, FAILED_FILE, NO_AUTH_FILE, CVE_LOG_FILE):
+        for path in (RESULT_FILE, HTML_FILE, FAILED_FILE, NO_AUTH_FILE,
+                     CVE_LOG_FILE, HTTP_CVE_FILE):
             if path is not None:
                 try:
                     path.touch()
@@ -367,7 +384,7 @@ def write_summary(path: Path, stats: dict, elapsed: float = 0.0) -> None:
         "statistics": {
             k: stats.get(k, 0)
             for k in ("checked", "found", "screenshots", "found_no_frame",
-                      "cve_found", "cve_tested")
+                      "cve_found", "cve_tested", "http_checked", "http_found")
         },
         "vendors": stats.get("vendors", {}),
         "ports": stats.get("ports", {}),

@@ -297,5 +297,21 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--http-ports",
+    nargs="+",
+    default=[80, 443, 8080],
+    type=port,
+    help=(
+        "HTTP/HTTPS ports probed for CVE exploits when no RTSP port answers "
+        "(default: 80 443 8080). Only checked in 'cve' or 'combined' mode, "
+        "and only for hosts whose RTSP ports are all closed."
+    ),
+)
+parser.add_argument(
+    "--no-http",
+    action="store_true",
+    help="disable the HTTP CVE-probe fallback for hosts with no live RTSP port",
+)
+parser.add_argument(
     "-v", "--version", action="version", version=f"%(prog)s {__version__}"
 )

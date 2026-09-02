@@ -9,7 +9,9 @@ from CamReaper.cve import (
     try_backdoor_creds,
     run_cve_stage,
     try_http_probe,
+    probe_http_host,
 )
+from CamReaper.vendor import detect_vendor_http
 from CamReaper.scanner import Settings, run
 from CamReaper.rtsp import RTSPClient
 
@@ -366,3 +368,135 @@ async def test_cve_log_records_success(report_paths, sample_db, tmp_path):
     finally:
         await mocks.stop()
         report.CVE_LOG_FILE = None
+
+
+async def test_detect_vendor_http_header_and_body():
+    """detect_vendor_http must fingerprint from the body and Server header."""
+    assert detect_vendor_http("", "<html>Hikvision web panel</html>") == "Hikvision"
+    assert detect_vendor_http("Dahua", "") == "Dahua"
+    assert detect_vendor_http("nginx", "") == "Generic"
+
+
+async def test_probe_http_host_finds_hit(report_paths, sample_db, tmp_path):
+    """probe_http_host returns an HTTP CVE hit when the panel is vulnerable."""
+    from tests.mock_http import make_server
+
+    report.HTTP_CVE_FILE = tmp_path / "http_cve.txt"
+    report.HTTP_CVE_FILE.touch()
+    srv = await make_server({
+        "/SDK/config": (200, "<Configuration>Hikvision panel</Configuration>"),
+        "/": (200, "Hikvision web"),
+    })
+    try:
+        db = CVEDatabase(sample_db)
+        found = await probe_http_host("127.0.0.1", srv.port, db)
+        assert any(f.is_http_cve for f in found)
+        hit = [f for f in found if f.is_http_cve][0]
+        assert hit.cve_id == "CVE-2017-7921-http"
+        assert hit.port == srv.port
+    finally:
+        await srv.stop()
+        report.HTTP_CVE_FILE = None
+
+
+async def test_probe_http_host_no_match(report_paths, sample_db):
+    """A panel with no matching patterns yields no hits."""
+    from tests.mock_http import make_server
+
+    srv = await make_server({
+        "/SDK/config": (200, "nothing useful here"),
+        "/": (200, "Hikvision web"),
+    })
+    try:
+        db = CVEDatabase(sample_db)
+        found = await probe_http_host("127.0.0.1", srv.port, db)
+        assert found == []
+    finally:
+        await srv.stop()
+
+
+async def test_probe_http_host_connection_refused(report_paths, sample_db):
+    """No HTTP server -> no hits, graceful."""
+    db = CVEDatabase(sample_db)
+    found = await probe_http_host("127.0.0.1", 1, db)
+    assert found == []
+
+
+async def test_http_fallback_end_to_end(report_paths, sample_db, tmp_path):
+    """When the RTSP port is dead but HTTP is vulnerable, the scanner must log
+    the HTTP CVE hit in http_cve.txt (not result.txt) and count http_found."""
+    from tests.mock_http import make_server
+
+    http = await make_server({
+        "/SDK/config": (200, "<Configuration>Hikvision panel</Configuration>"),
+        "/": (200, "Hikvision web"),
+    })
+    report.HTTP_CVE_FILE = tmp_path / "http_cve.txt"
+    report.HTTP_CVE_FILE.touch()
+    report.CVE_LOG_FILE = tmp_path / "cve_log.txt"
+    report.CVE_LOG_FILE.touch()
+    try:
+        db = CVEDatabase(sample_db)
+
+        async def targets():
+            yield "127.0.0.1"
+
+        settings = Settings(
+            # no RTSP port open on this host
+            ports=[1],
+            routes=["/"],
+            credentials=["a:b"],
+            timeout=1.0,
+            host_concurrency=5,
+            screenshot_concurrency=1,
+            enable_screenshots=False,
+            mode="combined",
+            cve_db=db,
+            http_ports=[http.port],
+        )
+        stats = await run(targets(), settings)
+        assert stats["found"] == 0  # no RTSP stream
+        assert stats["http_found"] >= 1
+        assert stats["http_checked"] >= 1
+        await report.close_report_files()
+        assert "CVE-2017-7921-http" in report.HTTP_CVE_FILE.read_text()
+        # the substring must NOT be in result.txt
+        assert "CVE" not in report_paths.read_text()
+    finally:
+        await http.stop()
+        report.HTTP_CVE_FILE = None
+        report.CVE_LOG_FILE = None
+
+
+async def test_no_http_flag_disables_fallback(report_paths, sample_db, tmp_path):
+    """With no_http=True the scanner must not probe HTTP at all."""
+    from tests.mock_http import make_server
+
+    http = await make_server({
+        "/SDK/config": (200, "<Configuration>Hikvision panel</Configuration>"),
+        "/": (200, "Hikvision web"),
+    })
+    try:
+        db = CVEDatabase(sample_db)
+
+        async def targets():
+            yield "127.0.0.1"
+
+        settings = Settings(
+            ports=[1],
+            routes=["/"],
+            credentials=["a:b"],
+            timeout=1.0,
+            host_concurrency=5,
+            screenshot_concurrency=1,
+            enable_screenshots=False,
+            mode="combined",
+            cve_db=db,
+            http_ports=[http.port],
+            no_http=True,
+        )
+        stats = await run(targets(), settings)
+        assert stats["http_checked"] == 0
+        assert stats["http_found"] == 0
+    finally:
+        await http.stop()

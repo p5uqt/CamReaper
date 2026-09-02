@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from CamReaper import report
-from CamReaper.report import record_failed, record_gallery, record_no_auth, record_url
+from CamReaper.report import record_failed, record_gallery, record_http_cve, record_no_auth, record_url
 from CamReaper.rtsp import RTSPClient, Status
 from CamReaper.vendor import detect_vendor
 
@@ -41,6 +41,8 @@ class Found:
     route: str
     credentials: str
     vendor: str = "Generic"
+    is_http_cve: bool = False  # True for HTTP CVE hits (no RTSP URL)
+    cve_id: str = ""  # CVE id when found via an HTTP CVE probe
 
     def url(self) -> str:
         return RTSPClient.get_rtsp_url(self.ip, self.port, self.credentials, self.route)
@@ -69,6 +71,8 @@ class Settings:
     mode: str = "brute"  # "brute" | "cve" | "combined"
     cve_db: object = None  # CVEDatabase instance or None
     http_timeout: float = 5.0  # timeout for CVE HTTP probes
+    http_ports: list = field(default_factory=lambda: [80, 443, 8080])
+    no_http: bool = False  # disable HTTP CVE-probe fallback
 
 
 async def _try_auth(client: RTSPClient, cred: str, route: str):
@@ -268,8 +272,12 @@ def _failure_reason(client: RTSPClient, code: str) -> str:
     return "no-response"
 
 
-async def _handle_host(ip: str, s: Settings) -> list:
-    """Run the full pipeline for one IP.  Returns a list of Found streams."""
+async def _handle_host(ip: str, s: Settings, stats: dict = None) -> list:
+    """Run the full pipeline for one IP.  Returns a list of Found streams.
+
+    ``stats`` (optional) is a mutable dict mutated in place for counters that
+    machinery outside ``_guard`` needs to update (cve_tested, http_checked).
+    """
     found: list = []
 
     # ---- stage 1: find a live port that "responds" (200/401/403) ----
@@ -314,6 +322,24 @@ async def _handle_host(ip: str, s: Settings) -> list:
         client.close()
 
     if live is None:
+        # No live RTSP port.  In 'cve'/'combined' mode, fall back to probing
+        # the configured HTTP/HTTPS ports for CVE exploits on the device's web
+        # panel (e.g. Hikvision/Dahua config disclosure, RCE endpoints).
+        # Skipped when the user disabled HTTP probing, or no CVE db is loaded.
+        if (
+            not s.no_http
+            and s.mode in ("cve", "combined")
+            and s.cve_db
+            and s.http_ports
+        ):
+            from CamReaper.cve import probe_http_host
+
+            for hport in s.http_ports:
+                found_here = await probe_http_host(
+                    ip, hport, s.cve_db, s.http_timeout, stats
+                )
+                if found_here:
+                    found.extend(found_here)
         return found
 
     # A pathological camera (accepts the port but stalls mid-brute) must not
@@ -350,8 +376,11 @@ async def _handle_host(ip: str, s: Settings) -> list:
 
         cve_found = await run_cve_stage(
             ip, live, vendor, s.cve_db, s.route_parallel, s.http_timeout,
+            stats,
         )
         if cve_found:
+            if stats is not None:
+                stats["cve_found"] = stats.get("cve_found", 0) + len(cve_found)
             found.extend(cve_found)
             live.close()
             return found
@@ -494,6 +523,8 @@ async def run(iter_targets, s: Settings, on_counter=None, on_status=None) -> dic
         "ports": {},  # port -> count of confirmed streams
         "cve_found": 0,  # streams found via CVE exploits
         "cve_tested": 0,  # CVE exploits tested
+        "http_checked": 0,  # HTTP ports probed for CVE exploits
+        "http_found": 0,  # HTTP ports with matched CVE exploits
     }
     # ip -> monotonic start time of the in-flight host pipeline, so the
     # watchdog can surface a stalled tail instead of a silent trickle.
@@ -506,16 +537,22 @@ async def run(iter_targets, s: Settings, on_counter=None, on_status=None) -> dic
         inflight[ip] = t_start
         try:
             async with sem:
-                found = await _handle_host(ip, s)
+                found = await _handle_host(ip, s, stats)
                 if found:
-                    stats["found"] += len(found)
                     for f in found:
-                        await record_url(f.url())
-                        await result_queue.put(f)
-                        vendors = stats["vendors"]
-                        vendors[f.vendor] = vendors.get(f.vendor, 0) + 1
-                        ports = stats["ports"]
-                        ports[str(f.port)] = ports.get(str(f.port), 0) + 1
+                        if f.is_http_cve:
+                            # HTTP CVE hit: not an RTSP stream - log it to the
+                            # http_cve file and count it separately.
+                            stats["http_found"] += 1
+                            await record_http_cve(ip, f.port, f.cve_id)
+                        else:
+                            stats["found"] += 1
+                            await record_url(f.url())
+                            await result_queue.put(f)
+                            vendors = stats["vendors"]
+                            vendors[f.vendor] = vendors.get(f.vendor, 0) + 1
+                            ports = stats["ports"]
+                            ports[str(f.port)] = ports.get(str(f.port), 0) + 1
                 stats["checked"] += 1
                 if on_counter:
                     on_counter(stats, ip)

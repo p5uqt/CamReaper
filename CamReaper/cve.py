@@ -17,6 +17,7 @@ import json
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, field
+from http.client import BadStatusLine
 from pathlib import Path
 from typing import Optional
 
@@ -231,10 +232,11 @@ async def run_cve_stage(
     cve_db: CVEDatabase,
     route_parallel: int = 8,
     http_timeout: float = 5.0,
+    stats: dict = None,
 ) -> list:
     """Run all CVE exploits for a detected vendor against one host.
 
-    Returns a list of Found-like dicts with ``cve_id`` field set.
+    Returns a list of Found streams.
     """
     from CamReaper.scanner import Found
 
@@ -244,6 +246,8 @@ async def run_cve_stage(
 
     found = []
     for entry in entries:
+        if stats is not None:
+            stats["cve_tested"] = stats.get("cve_tested", 0) + 1
         if entry.type == "backdoor_creds":
             cred = await try_backdoor_creds(live, entry, route_parallel)
             if cred:
@@ -267,4 +271,70 @@ async def run_cve_stage(
             # the CVE is present. We log it but don't add to found streams
             # unless we also found creds via backdoor_creds for this vendor.
 
+    return found
+
+
+async def probe_http_host(
+    ip: str,
+    port: int,
+    cve_db: CVEDatabase,
+    timeout: float = 5.0,
+    stats: dict = None,
+) -> list:
+    """Probe one HTTP/HTTPS port for CVE exploits on a host's web panel.
+
+    Fetches the root page to fingerprint the vendor, then runs every applicable
+    ``http_probe`` CVE for that vendor (plus any generic http_probe CVEs).
+    Returns a list of Found entries flagged as HTTP CVE hits.
+    """
+    import urllib.error
+
+    from CamReaper.scanner import Found
+    from CamReaper.vendor import detect_vendor_http
+
+    # Fingerprint via a lightweight root GET (Server header + a peek of body).
+    scheme = "https" if port in (443, 8443) else "http"
+    actual_port = port if port not in (80, 443) else ""
+    host = f"{ip}:{actual_port}" if actual_port else ip
+
+    def _root():
+        url = f"{scheme}://{host}/"
+        try:
+            resp = urllib.request.urlopen(url, timeout=timeout)
+            return resp.read(8192).decode("utf-8", errors="replace")
+        except (urllib.error.URLError, OSError, ValueError, BadStatusLine):
+            return ""
+
+    body = await asyncio.to_thread(_root)
+    if not body:
+        return []
+    if stats is not None:
+        stats["http_checked"] = stats.get("http_checked", 0) + 1
+
+    vendor = detect_vendor_http("", body)
+
+    # Candidate entries: vendor-specific for the detected vendor, plus any
+    # Generic http_probe entries (vendor-agnostic endpoints).
+    entries = list(cve_db.get_for_vendor(vendor))
+    if vendor != "Generic":
+        entries += cve_db.get_for_vendor("Generic")
+    entries = [e for e in entries if e.type == "http_probe"]
+    if not entries:
+        return []
+
+    found = []
+    for entry in entries:
+        if stats is not None:
+            stats["cve_tested"] = stats.get("cve_tested", 0) + 1
+        try:
+            ok = await try_http_probe(ip, port, entry, timeout)
+        except Exception:
+            ok = False
+        await record_cve_test(ip, port, entry.id, ok)
+        if ok:
+            found.append(Found(
+                ip=ip, port=port, route=entry.url_path,
+                credentials="", vendor=vendor,
+                is_http_cve=True, cve_id=entry.id,
+            ))
     return found
