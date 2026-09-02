@@ -1,23 +1,25 @@
+
 # CamReaper
 
-Асинхронный сканер RTSP-потоков с капчей скриншотов и генерацией HTML-галереи.
+Асинхронный сканер RTSP-потоков со снятием скриншотов и генерацией галереи.
 
-Сканирует сети на наличие RTSP-стримов камер, подбирает маршруты и учетные данные, делает скриншоты и собирает HTML-галлерию.
+Сканирует сети на наличие RTSP-потоков камер, перебирает маршруты и учётные данные, делает скриншоты и создаёт HTML-галерею.
 
 ---
 
-## Фичи
+## Возможности
 
-- **Async architecture** - асинхронный цикл событий asyncio с ограниченной concurrency, без блокирующих потоков
-- **Route discovery** - parallel route probing across 810+ vendor paths (ONVIF, Dahua, Hikvision, Uniview, Axis, Samsung, Panasonic, Tapo, etc.)
-- **Credential brute-force** - Basic и Digest (двухшаговый) аутентификация
-- **Screenshots** - FFmpeg-based capture с жестким таймаутом (изоляция subprocess)
-- **HTML gallery** - клик для копирования RTSP URL, двойной клик для полноэкранного просмотра
-- **Multi-channel expansion** - Hikvision 101-1601, Dahua ch1-8, ONVIF channel/subtype
-- **CVE exploits** - vendor-aware scans (`brute` / `cve` / `combined`) используя backdoor credentials и HTTP probes against 26+ documented CVEs (Hikvision, Dahua, Zosi, Xiongmai, PTZOptics, Sony, V380, AVTECH, ...)
-- **HTTP fallback probing** - хосты без live RTSP порта пронумерованы на их веб-панели (80/443/8080) для уязвимостей CVE
-- **Deduplication** - LRU-based IP dedup для overlapping CIDRs/ranges
-- **Report output** - result.txt, streams.m3u, summary.json, failed.txt, noauth.txt, cve_log.txt, http_cve.txt
+* **Асинхронная архитектура** — цикл `asyncio` с ограниченным количеством одновременно выполняемых задач, без блокирующих потоков. Русская документация находится в [README.ru.md](README.ru.md).
+* **Поиск маршрутов** — параллельная проверка более 810 путей различных производителей (ONVIF, Dahua, Hikvision, Uniview, Axis, Samsung, Panasonic, Tapo и др.).
+* **Перебор учётных данных** — поддержка Basic и Digest-аутентификации (двухэтапная).
+* **Скриншоты** — захват с помощью FFmpeg с жёстким тайм-аутом (изоляция через subprocess).
+* **HTML-галерея** — нажатие копирует RTSP URL, двойное нажатие открывает полноэкранный режим.
+* **Расширение по каналам** — Hikvision 101–1601, Dahua ch1–8, ONVIF channel/subtype.
+* **Возобновляемое сканирование** — сохранение контрольной точки и состояния для продолжения прерванных запусков.
+* **Эксплойты CVE** — специализированное сканирование (`brute` / `cve` / `combined`) с использованием бэкдор-учётных данных и HTTP-запросов для проверки 26+ документированных CVE (Hikvision, Dahua, Zosi, Xiongmai, PTZOptics, Sony, V380, AVTECH и др.).
+* **Резервная проверка через HTTP** — хосты без активного RTSP-порта проверяются через их веб-панель (80/443/8080) на наличие уязвимостей CVE.
+* **Дедупликация** — LRU-дедупликация IP-адресов при пересекающихся CIDR/диапазонах.
+* **Вывод результатов** — `result.txt`, `streams.m3u`, `summary.json`, `failed.txt`, `noauth.txt`, `cve_log.txt`, `http_cve.txt`.
 
 ---
 
@@ -27,20 +29,20 @@
 pip install -e .
 ```
 
-Требуется Python >= 3.8. Для скриншотов `av` и `Pillow` должны быть установлены. Без них используйте `--no-screenshots` для纯 brute-force режима.
+Требуется Python >= 3.8. Для создания скриншотов необходимо установить `av` и `Pillow`. Без них используйте `--no-screenshots` для режима только перебора учётных данных.
 
 ---
 
 ## Быстрый старт
 
 ```bash
-# Basic scan with multiple ports
+# Базовое сканирование с несколькими портами
 CamReaper -t targets.txt -p 554 8554 5554
 
-# Custom routes and credentials
+# Пользовательские маршруты и учётные данные
 CamReaper -t ips.txt -r routes.txt -c combos.txt -ct 500 -T 1
 
-# Fast scan without screenshots
+# Быстрое сканирование без скриншотов
 CamReaper -t broad_cidr.txt --no-screenshots -p 554
 ```
 
@@ -52,136 +54,138 @@ CamReaper -t broad_cidr.txt --no-screenshots -p 554
 CamReaper [OPTIONS]
 ```
 
-### Required
+### Обязательные параметры
 
-| Флаг | Описание |
-|------|-------------|
-| `-t, --targets FILE` | Файл с целевыми IP, CIDR или IP диапазонами (по одному на строку) |
+| Флаг                 | Описание                                                               |
+| -------------------- | ---------------------------------------------------------------------- |
+| `-t, --targets FILE` | Файл с целями — IP-адреса, CIDR или диапазоны IP (по одному на строку) |
 
-### Scan Options
+### Параметры сканирования
 
-| Флаг | По умолчанию | Описание |
-|------|-------------|-------------|
-| `-p, --ports PORTS` | `554` | RTSP порты для сканирования |
-| `-r, --routes FILE` | встроенный | Пользовательский список маршрутов |
-| `-c, --credentials FILE` | встроенный | Список учетных данных (`user:pass` на строку) |
-| `-ct, --check-concurrency N` | `300` | Максимум параллельных задач на хост |
-| `-T, --timeout S` | `2.0` | Таймаут сокета в секундах |
-| `--max-attempts N` | `0` (бесконечно) | Ограничить количество попыток creds на хост |
-| `--attempts-per-sec N` | `0` (нет) | Rate limit на хост |
-| `--host-timeout S` | `0` (бесконечно) | Wall-clock budget на хост |
-| `--route-parallel N` | `8` | Количество маршрутов, проверяемых параллельно (0 = serial) |
-| `--dedup` | off | Пропустить duplicate IPs из overlapping ranges |
-| `--dedup-size N` | `1000000` | LRU cache size для dedup |
-| `--mode MODE` | `brute` | Стратегия сканирования: `brute` (по умолчанию), `cve` (только CVE), `combined` (CVE сначала, потом brute) |
-| `--cve-db PATH` | встроенный | Путь к кастомному JSON файлу с CVE базами данных |
-| `--http-ports PORTS` | `80 443 8080` | HTTP/HTTPS порты для CVE-probe на хостах без live RTSP порта |
-| `--no-http` | off | Отключить HTTP CVE-probe fallback для хостов без live RTSP порта |
+| Флаг                         | По умолчанию          | Описание                                                                                                        |
+| ---------------------------- | --------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `-p, --ports PORTS`          | `554`                 | RTSP-порты для сканирования                                                                                     |
+| `-r, --routes FILE`          | встроенный            | Пользовательский список маршрутов                                                                               |
+| `-c, --credentials FILE`     | встроенный            | Список учётных данных (`user:pass` на строку)                                                                   |
+| `-ct, --check-concurrency N` | `300`                 | Максимальное количество одновременно обрабатываемых хостов                                                      |
+| `-T, --timeout S`            | `2.0`                 | Тайм-аут сокета в секундах                                                                                      |
+| `--max-attempts N`           | `0` (без ограничений) | Максимальное количество попыток с учётными данными на один хост                                                 |
+| `--attempts-per-sec N`       | `0` (без ограничений) | Ограничение количества попыток в секунду для одного хоста                                                       |
+| `--host-timeout S`           | `0` (без ограничений) | Максимальное общее время обработки одного хоста                                                                 |
+| `--route-parallel N`         | `8`                   | Количество маршрутов, проверяемых параллельно (`0` = последовательно)                                           |
+| `--dedup`                    | выключено             | Пропускать дублирующиеся IP из пересекающихся диапазонов                                                        |
+| `--dedup-size N`             | `1000000`             | Размер LRU-кэша для дедупликации                                                                                |
+| `--mode MODE`                | `brute`               | Стратегия сканирования: `brute` (по умолчанию), `cve` (только CVE), `combined` (сначала CVE, затем brute-force) |
+| `--cve-db PATH`              | встроенная            | Путь к пользовательской базе CVE в формате JSON                                                                 |
+| `--http-ports PORTS`         | `80 443 8080`         | HTTP/HTTPS-порты для проверки CVE на хостах без активного RTSP-порта                                            |
+| `--no-http`                  | выключено             | Отключить резервную проверку CVE через HTTP                                                                     |
 
-### Screenshot Options
+### Параметры скриншотов
 
-| Флаг | По умолчанию | Описание |
-|------|-------------|-------------|
-| `-st, --screenshot-concurrency N` | `20` | Максимум параллельных работников скриншотов |
-| `--screenshot-timeout S` | `10.0` | Таймаут на одноCapture-frame |
-| `--no-screenshots` | off | Пропустить скриншоты полностью |
-| `--scan-channels` | off | Перекапчуры все channels после сканирования |
-| `--scan-routes FILE` | такое же, как `-r` | Список маршрутов для channel probing |
+| Флаг                              | По умолчанию       | Описание                                                                   |
+| --------------------------------- | ------------------ | -------------------------------------------------------------------------- |
+| `-st, --screenshot-concurrency N` | `20`               | Максимальное количество одновременно выполняемых задач создания скриншотов |
+| `--screenshot-timeout S`          | `10.0`             | Тайм-аут одного кадра скриншота                                            |
+| `--no-screenshots`                | выключено          | Полностью отключить создание скриншотов                                    |
+| `--scan-channels`                 | выключено          | Повторно захватить все каналы после сканирования                           |
+| `--scan-routes FILE`              | такой же, как `-r` | Список маршрутов для проверки каналов                                      |
 
-### Output Options
+### Параметры вывода
 
-| Флаг | По умолчанию | Описание |
-|------|-------------|-------------|
-| `--gallery-html FILE` | - | Построить галерею из списка URL (без сканирования) |
-| `--capture FILE` | - | Режим только скриншотов из result.txt |
-| `--failed-file [PATH]` | off | Записать reachable-but-unconfirmed hosts |
-| `--failed-with-error` | off | Добавить причину ошибки в линии failed |
-| `--no-auth-file [PATH]` | off | Записать хосты, где не сработала никакая учетная запись |
-| `--checkpoint [PATH]` | auto | Сохранить прогресс для resumed сканирования |
-| `--resume [PATH]` | auto | Восстановить сканирование из checkpoint |
+| Флаг                    | По умолчанию  | Описание                                                        |
+| ----------------------- | ------------- | --------------------------------------------------------------- |
+| `--gallery-html FILE`   | -             | Создать галерею из списка URL (без сканирования)                |
+| `--capture FILE`        | -             | Режим только создания скриншотов из `result.txt`                |
+| `--failed-file [PATH]`  | выключено     | Записывать доступные, но неподтверждённые хосты                 |
+| `--failed-with-error`   | выключено     | Добавлять причину ошибки к строкам в `failed.txt`               |
+| `--no-auth-file [PATH]` | выключено     | Записывать хосты, для которых ни одни учётные данные не подошли |
+| `--checkpoint [PATH]`   | автоматически | Сохранять прогресс для последующего продолжения                 |
+| `--resume [PATH]`       | автоматически | Продолжить сканирование с контрольной точки                     |
 
 ---
 
 ## Примеры
 
-### Сканирование сети
+### Сканирование диапазона сети
 
 ```bash
 CamReaper -t 192.168.1.0/24 -p 554 8554
 ```
 
-### С кастомными wordlists
+### Сканирование с пользовательскими словарями
 
 ```bash
 CamReaper -t targets.txt -r custom_routes.txt -c custom_creds.txt
 ```
 
-### Быстрое сканирование без скриншотов
+### Быстрое обнаружение без скриншотов
 
 ```bash
 CamReaper -t large_network.txt --no-screenshots -p 554 --dedup
 ```
 
-### Восстанавливаемое сканирование
+### Возобновляемое длительное сканирование
 
 ```bash
 CamReaper -t huge_list.txt --checkpoint --resume
 ```
 
-### Построение галереи из предыдущих результатов
+### Создание галереи из предыдущих результатов
 
 ```bash
 CamReaper --gallery-html urls.txt
 CamReaper --capture reports/2026.09.01-12.00.00/result.txt
 ```
 
-### С ограничением скорости
+### Сканирование с ограничением скорости
 
 ```bash
 CamReaper -t targets.txt --attempts-per-sec 5 --max-attempts 10 --host-timeout 30
 ```
 
-### С CVE эксплойтами
+### Сканирование с использованием CVE-эксплойтов
 
 ```bash
-# CVE-only: backdoor credentials + HTTP probes, no brute-force
+# Только CVE: бэкдор-учётные данные + HTTP-проверки, без brute-force
 CamReaper -t targets.txt --mode cve
 
-# Combined: CVE exploits first, then brute-force for what remains
+# Комбинированный режим: сначала CVE-эксплойты, затем brute-force для оставшихся целей
 CamReaper -t targets.txt --mode combined
 
-# Skip the HTTP web-panel fallback
+# Пропустить резервную проверку через HTTP-веб-панель
 CamReaper -t targets.txt --mode combined --no-http
 ```
 
 ---
 
-## Скану CVE
+## Сканирование CVE
 
-Когда `--mode` установлен в `cve` или `combined`, CamReaper включаетKnown exploits для камеры, вендер определен из RTSP `Server` header (и для HTTP — из веб-панели `Server` header / body):
+Когда `--mode` установлен в `cve` или `combined`, CamReaper включает проверку известных эксплойтов в зависимости от производителя камеры, определённого по заголовку `Server` RTSP (а для HTTP — по заголовку `Server` веб-панели / содержимому страницы):
 
-1. **Backdoor credentials** (`backdoor_creds`) - tries vendor-documented default или hardcoded credentials (например, Hikvision `admin:Hik@2014`), которые оператор никогда не менял. Удачный login дает playable RTSP URL, записываемый в `result.txt`.
-2. **HTTP probes** (`http_probe`) - issues a crafted HTTP request и matching the response against the CVE's success pattern to confirm the vulnerability is present (config disclosure, RCE endpoints и т.д.).
+1. **Бэкдор-учётные данные** (`backdoor_creds`) — проверяются документированные производителем стандартные или жёстко заданные учётные данные (например, `admin:Hik@2014` для Hikvision), которые оператор никогда не менял. Успешная авторизация позволяет получить рабочий RTSP URL, который записывается в `result.txt`.
+2. **HTTP-проверки** (`http_probe`) — отправляется специально сформированный HTTP-запрос, после чего ответ сопоставляется с шаблоном успешного результата CVE для подтверждения наличия уязвимости (раскрытие конфигурации, RCE-эндпоинты и т. д.).
 
-Для хостов, чьи RTSP порты **все закрыты**, CamReaper падает back to probing the configured `--http-ports` (default `80 443 8080`) на удаленном веб-панели. Эти HTTP-only hits confirm a vulnerable panel but do **not** produce a playable RTSP stream, поэтому они записываются в `http_cve.txt` вместо `result.txt`.
+Для хостов, у которых **все RTSP-порты закрыты**, CamReaper выполняет резервную проверку настроенных `--http-ports` (по умолчанию `80 443 8080`) на удалённой веб-панели.
+
+Такие HTTP-only результаты подтверждают наличие уязвимой панели, но **не дают рабочего RTSP-потока**, поэтому записываются в `http_cve.txt`, а не в `result.txt`.
 
 Режимы:
 
-| Режим | Поведение |
-|-------|-----------|
-| `brute` (default) | Только credential/route brute-force, CVE стадия пропущена |
-| `cve` | Только CVE exploits, brute-force пропущен |
-| `combined` | CVE exploits сначала, потом brute-force для хостов, которые не найдены |
+| Режим                  | Поведение                                                                        |
+| ---------------------- | -------------------------------------------------------------------------------- |
+| `brute` (по умолчанию) | Только перебор учётных данных и маршрутов, этап CVE пропускается                 |
+| `cve`                  | Только эксплойты CVE, brute-force пропускается                                   |
+| `combined`             | Сначала эксплойты CVE, затем brute-force для хостов, которые ещё не были найдены |
 
-Встроенная CVE база данных (`CamReaper/cve_db.json`) поставляется с 26 entry'ами для Hikvision, Dahua, Zosi, Xiongmai, PTZOptics, Sony, V380, AVTECH и других, поддержка актуальна через 2024-2026 disclosure. Свои можно передать через `--cve-db PATH`.
+Встроенная база CVE (`CamReaper/cve_db.json`) содержит 26 записей для Hikvision, Dahua, Zosi, Xiongmai, PTZOptics, Sony, V380, AVTECH и других производителей и поддерживает актуальность по раскрытиям за 2024–2026 годы. Используйте собственную базу через `--cve-db PATH`.
 
 ---
 
 ## Форматы входных данных
 
-### Файл с целевыми хостами
+### Файл целей
 
-Одна запись на строку. Поддерживаемые форматы:
+Одна запись на строку. Поддерживаются следующие форматы:
 
 ```
 192.168.1.100
@@ -189,7 +193,7 @@ CamReaper -t targets.txt --mode combined --no-http
 10.0.0.1 - 10.0.0.254
 ```
 
-### Файл с маршрутами
+### Файл маршрутов
 
 Каждый маршрут начинается с `/`:
 
@@ -199,11 +203,11 @@ CamReaper -t targets.txt --mode combined --no-http
 /cam/realmonitor?channel=1&subtype=0
 /Streaming/Channels/101/
 /h264/ch1/main/av_stream
-`
+```
 
-### Файл с учетными данными
+### Файл учётных данных
 
-`user:pass` на строку:
+Формат `user:pass`, по одному на строку:
 
 ```
 admin:admin
@@ -213,34 +217,34 @@ admin:12345
 
 ---
 
-## Вывод
+## Результаты
 
-Каждый запуск создает папку с временной меткой под `reports/<timestamp>/`:
+Каждый запуск создаёт папку с временной меткой в `reports/<timestamp>/`:
 
-| Файл | Описание |
-|------|-------------|
-| `result.txt` | Подтвержденные URL потоков (по одному на строку) |
-| `streams.m3u` | То же, что и result.txt, но в формате M3U (открывается в VLC) |
-| `summary.json` | Статистика: checked, found, screenshots, breakdown по vendor/port |
-| `pics/` | Сaptured screenshots |
-| `index.html` | Интерактивная галерея с кликом для копирования и полноэкранным просмотром |
-| `checkpoint.json` | Состояние для resumed (если `--checkpoint` использовался) |
-| `failed.txt` | Reachable-but-unconfirmed hosts (если `--failed-file` использовался) |
-| `noauth.txt` | Подтвержденные камеры с нет matching credential (если `--no-auth-file` использовался) |
-| `cve_log.txt` | Попыток CVE, одна на строку: `ip port CVE-ID SUCCESS\|FAIL` (в режиме `cve`/`combined`) |
-| `http_cve.txt` | Хосты с уязвимой веб-панелью но без live RTSP порта: `ip port CVE-ID` (если HTTP probing включен) |
+| Файл              | Описание                                                                                                   |
+| ----------------- | ---------------------------------------------------------------------------------------------------------- |
+| `result.txt`      | Подтверждённые URL потоков (по одному на строку)                                                           |
+| `streams.m3u`     | Те же URL в формате M3U-плейлиста (можно открыть в VLC)                                                    |
+| `summary.json`    | Статистика: проверенные, найденные хосты, скриншоты, распределение по производителям/портам                |
+| `pics/`           | Сохранённые скриншоты                                                                                      |
+| `index.html`      | Интерактивная галерея с копированием по нажатию и полноэкранным режимом                                    |
+| `checkpoint.json` | Состояние для продолжения (если использовался `--checkpoint`)                                              |
+| `failed.txt`      | Доступные, но неподтверждённые хосты (если использовался `--failed-file`)                                  |
+| `noauth.txt`      | Подтверждённые камеры, для которых не подошли ни одни учётные данные (если использовался `--no-auth-file`) |
+| `cve_log.txt`     | Попытки эксплуатации CVE, по одной на строку: `ip port CVE-ID SUCCESS\|FAIL` (в режимах `cve`/`combined`)  |
+| `http_cve.txt`    | Хосты с уязвимой веб-панелью, но без активного RTSP-порта: `ip port CVE-ID` (если включена HTTP-проверка)  |
 
 ---
 
 ## Возможности галереи
 
-HTML галерея (`index.html`) предоставляет:
+HTML-галерея (`index.html`) предоставляет:
 
-- **Клик для копирования** - копирует RTSP URL в буфер обмена
-- **Двойной клик полноэкранный** - открывает скриншот в lightbox
-- **Выпадающий список режимов копирования** - переключает между plain URL и командой `ffplay`
-- **Группировка камер** - скриншоты от одной камеры группируются под заголовком
-- **Детекция вендора** - заголовки показывают детектированный вендор (Hikvision, Dahua, ONVIF и т.д.)
+* **Копирование по нажатию** — копирует RTSP URL в буфер обмена
+* **Полноэкранный режим по двойному нажатию** — открывает скриншот в lightbox
+* **Выпадающий список режима копирования** — переключение между обычным URL и командой `ffplay`
+* **Группировка камер** — скриншоты одной и той же камеры группируются под общим заголовком
+* **Определение производителя** — в заголовках отображается определённый производитель (Hikvision, Dahua, ONVIF и т. д.)
 
 ---
 
@@ -259,7 +263,7 @@ python -m pytest -q
 pytest --cov=CamReaper
 ```
 
-### Lint
+### Линтеры
 
 ```bash
 black CamReaper/ tests/
@@ -270,4 +274,4 @@ isort --profile black CamReaper/ tests/
 
 ## Лицензия
 
-GPL-3.0 - см. [LICENSE](LICENSE) для подробностей.
+GPL-3.0 — см. [LICENSE](LICENSE).
