@@ -24,10 +24,59 @@ def file_path(value: Any):
     raise argparse.ArgumentTypeError(f"{value} is not a valid path")
 
 
-def port(value: Any):
-    if int(value) in range(65536):
-        return int(value)
+def _check_port(number: int, value: Any) -> int:
+    if 1 <= number <= 65535:
+        return number
     raise argparse.ArgumentTypeError(f"{value} is not a valid port")
+
+
+def port(value: Any) -> list:
+    """Parse one port spec into a list of ports.
+
+    Accepted forms: ``554``, ``8000-8008`` (inclusive range) and
+    ``8554-8554`` (single-port range).  A reversed range such as
+    ``8008-8000`` is rejected instead of silently returning nothing.
+    """
+    text = str(value).strip()
+    if "-" in text:
+        low_s, _, high_s = text.partition("-")
+        try:
+            low = _check_port(int(low_s), value)
+            high = _check_port(int(high_s), value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"{value} is not a valid port range"
+            ) from None
+        if low > high:
+            raise argparse.ArgumentTypeError(f"{value} is not a valid port range")
+        return list(range(low, high + 1))
+    try:
+        return [_check_port(int(text), value)]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value} is not a valid port") from None
+
+
+class PortList(argparse.Action):
+    """Collect ``nargs="+"`` port specs into one flat, de-duplicated list.
+
+    A range spec such as ``8000-8008`` expands to several ports, so the specs
+    are flattened here, keeping the order the user asked for and dropping
+    duplicates.  Bad specs are reported as a normal argparse error.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if isinstance(values, (str, bytes)):
+            values = [values]
+        ports: list = []
+        for value in values:
+            try:
+                expanded = port(value)
+            except argparse.ArgumentTypeError as exc:
+                parser.error(f"argument {option_string or self.dest}: {exc}")
+            for number in expanded:
+                if number not in ports:
+                    ports.append(number)
+        setattr(namespace, self.dest, ports)
 
 
 def positive_int(value: Any):
@@ -54,9 +103,10 @@ parser.add_argument(
     "--ports",
     nargs="+",
     default=[554],
-    type=port,
+    action=PortList,
     help=(
-        "RTSP ports to scan (default: 554). Recommended: "
+        "RTSP ports to scan, ranges allowed (default: 554), e.g. "
+        "'554 8554' or '8000-8008'. Recommended: "
         "554 8554 5554 10554 8000 6800. Many cameras/DVRs also listen on "
         "8554/5554/10554/8000 in addition to 554."
     ),
@@ -300,11 +350,11 @@ parser.add_argument(
     "--http-ports",
     nargs="+",
     default=[80, 443, 8080],
-    type=port,
+    action=PortList,
     help=(
-        "HTTP/HTTPS ports probed for CVE exploits when no RTSP port answers "
-        "(default: 80 443 8080). Only checked in 'cve' or 'combined' mode, "
-        "and only for hosts whose RTSP ports are all closed."
+        "HTTP/HTTPS ports probed for CVE exploits when no RTSP port answers, "
+        "ranges allowed (default: 80 443 8080). Only checked in 'cve' or "
+        "'combined' mode, and only for hosts whose RTSP ports are all closed."
     ),
 )
 parser.add_argument(

@@ -38,6 +38,10 @@ Requires Python >= 3.8. For screenshots, `av` and `Pillow` must be installed. Wi
 # Basic scan with multiple ports
 CamReaper -t targets.txt -p 554 8554 5554
 
+# Port ranges
+CamReaper -t targets.txt -p 8000-8008
+CamReaper -t targets.txt -p 554 8000-8008 8554
+
 # Custom routes and credentials
 CamReaper -t ips.txt -r routes.txt -c combos.txt -ct 500 -T 1
 
@@ -63,7 +67,7 @@ CamReaper [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-p, --ports PORTS` | `554` | RTSP ports to scan |
+| `-p, --ports PORTS` | `554` | RTSP ports to scan; ranges allowed (`8000-8008`) |
 | `-r, --routes FILE` | built-in | Custom route list |
 | `-c, --credentials FILE` | built-in | Credential list (`user:pass` per line) |
 | `-ct, --check-concurrency N` | `300` | Max concurrent host pipelines |
@@ -76,7 +80,7 @@ CamReaper [OPTIONS]
 | `--dedup-size N` | `1000000` | LRU cache size for dedup |
 | `--mode MODE` | `brute` | Scan strategy: `brute` (default), `cve` (CVE only), `combined` (CVE first, then brute) |
 | `--cve-db PATH` | built-in | Path to a custom CVE database JSON file |
-| `--http-ports PORTS` | `80 443 8080` | HTTP/HTTPS ports probed for CVEs on hosts with no live RTSP port |
+| `--http-ports PORTS` | `80 443 8080` | HTTP/HTTPS ports probed for CVEs on hosts with no live RTSP port; ranges allowed (`8000-8008`) |
 | `--no-http` | off | Disable the HTTP CVE-probe fallback |
 
 ### Screenshot Options
