@@ -41,6 +41,23 @@ def test_channel_variants_onvif():
     assert "?channel=1&subtype=0" in variants[0]
     assert "?channel=1&subtype=1" in variants[1]
     assert "?channel=8&subtype=1" in variants[-1]
+    # A duplicated subtype parameter is a different (bogus) route.
+    assert all(v.count("subtype=") == 1 for v in variants)
+
+
+def test_channel_variants_onvif_keeps_other_params():
+    url = (
+        "rtsp://4.4.4.4:554/cam/realmonitor?channel=1&subtype=1"
+        "&unicast=true&proto=Onvif"
+    )
+    variants = list(channel_variants(url))
+    assert len(variants) == 16
+    assert variants[0] == (
+        "rtsp://4.4.4.4:554/cam/realmonitor?channel=1&subtype=0"
+        "&unicast=true&proto=Onvif"
+    )
+    assert all(v.count("subtype=") == 1 for v in variants)
+    assert all(v.endswith("&unicast=true&proto=Onvif") for v in variants)
 
 
 def test_channel_variants_unknown_path_kept_as_is():
@@ -101,6 +118,20 @@ def test_iter_url_list_skips_blank_and_comments(tmp_path):
     f = tmp_path / "list.txt"
     f.write_text("# comment\n\nrtsp://1.1.1.1/\n\nrtsp://2.2.2.2/s\n")
     assert list(iter_url_list(f)) == ["rtsp://1.1.1.1/", "rtsp://2.2.2.2/s"]
+
+
+def test_iter_url_list_drops_non_rtsp_lines(tmp_path):
+    """A mixed list file must not hand http:// lines to the capture pipeline."""
+    f = tmp_path / "list.txt"
+    f.write_text(
+        "rtsp://1.1.1.1/\nhttp://1.1.1.1/\nhttps://1.1.1.1/\n1.1.1.1\n"
+        "rtsp://2.2.2.2/s\nRTSP://3.3.3.3/\n"
+    )
+    assert list(iter_url_list(f)) == [
+        "rtsp://1.1.1.1/",
+        "rtsp://2.2.2.2/s",
+        "RTSP://3.3.3.3/",
+    ]
 
 
 @pytest.mark.asyncio

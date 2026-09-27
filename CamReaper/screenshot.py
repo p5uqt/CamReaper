@@ -8,13 +8,35 @@ blocking interpreter exit.
 """
 
 import asyncio
+import hashlib
 import multiprocessing
+import re
 from functools import partial
 from pathlib import Path
 
-from CamReaper.report import escape_chars
-
 ctx = multiprocessing.get_context("spawn")
+
+# Longest file name we produce.  ext4 allows 255 bytes, but a 120-char cap
+# keeps the names usable on FAT/exFAT (255 *bytes* with 8.3 constraints) and
+# well below the shell/glob limits.
+_MAX_NAME = 120
+_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def filename_for(rtsp_url: str) -> str:
+    """Return a safe, collision-free file name (without extension) for a URL.
+
+    ``str.lstrip("rtsp://")`` - the obvious one-liner - is a character *set*,
+    not a prefix: it also eats the leading 'r' of ``router.local`` and the
+    'r' of ``outer.local``, so two different cameras wrote to the same file.
+    Truncation is disambiguated with a hash of the full URL for the same reason.
+    """
+    body = rtsp_url[len("rtsp://"):] if rtsp_url.lower().startswith("rtsp://") else rtsp_url
+    name = _UNSAFE.sub("_", body)
+    if len(name) > _MAX_NAME:
+        digest = hashlib.sha1(rtsp_url.encode("utf-8", "replace")).hexdigest()[:10]
+        name = f"{name[:_MAX_NAME - 11]}_{digest}"
+    return name or "stream"
 
 
 def _capture(rtsp_url: str, out_dir: str, timeout: float, out_q) -> None:
@@ -37,7 +59,7 @@ def _capture(rtsp_url: str, out_dir: str, timeout: float, out_q) -> None:
                 return
             stream.thread_type = "AUTO"
             for frame in container.decode(video=0):
-                path = Path(out_dir) / f"{escape_chars(rtsp_url.lstrip('rtsp://'))}.jpg"
+                path = Path(out_dir) / f"{filename_for(rtsp_url)}.jpg"
                 frame.to_image().save(str(path))
                 out_q.put(str(path))
                 return
@@ -62,6 +84,9 @@ def _do_capture(url: str, out_dir: str, timeout: float) -> str:
             proc.join(timeout=2)
         if proc.is_alive():
             proc.kill()
+            # Reap the killed child: without this it lingers as a zombie for
+            # as long as the scan runs.
+            proc.join(timeout=2)
         try:
             out_q.close()
         except Exception:

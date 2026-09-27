@@ -1,13 +1,23 @@
+import re
+from pathlib import Path
+
 import setuptools
 
-from CamReaper import __version__
+HERE = Path(__file__).parent
+# Read the version out of the source instead of importing the package: a PEP 517
+# build runs setup.py in an isolated environment where CamReaper is not
+# importable, and importing it there fails the whole build.
+VERSION = re.search(
+    r'^__version__\s*=\s*["\']([^"\']+)["\']',
+    (HERE / "CamReaper" / "__init__.py").read_text(encoding="utf-8"),
+    re.MULTILINE,
+).group(1)
 
-with open("README.md", "r") as f:
-    long_description = f.read()
+long_description = (HERE / "README.md").read_text(encoding="utf-8")
 
 setuptools.setup(
     name="CamReaper",
-    version=__version__,
+    version=VERSION,
     description="Asynchronous RTSP stream scanner with screenshots and gallery",
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -30,6 +40,14 @@ setuptools.setup(
     packages=setuptools.find_packages(),
     install_requires=["av", "Pillow", "tqdm"],
     python_requires=">=3.8",
-    package_data={"CamReaper": ["credentials.txt", "routes.txt"]},
+    # The real data files are defroutes / defcreds (see CamReaper/__init__.py)
+    # plus the vendor and CVE tables.  The previous list named files that do not
+    # exist ("credentials.txt", "routes.txt"), so a wheel installed none of
+    # them and every default -r / -c / vendor lookup / --mode cve run failed
+    # with FileNotFoundError.
+    package_data={
+        "CamReaper": ["defroutes", "defcreds", "vendors.json", "cve_db.json"]
+    },
+    include_package_data=True,
     entry_points={"console_scripts": ["CamReaper = CamReaper.__main__:main"]},
 )

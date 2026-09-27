@@ -500,3 +500,87 @@ async def test_no_http_flag_disables_fallback(report_paths, sample_db, tmp_path)
         assert stats["http_found"] == 0
     finally:
         await http.stop()
+
+
+async def test_http_cve_hit_does_not_skip_brute_force(
+    report_paths, sample_db, tmp_path, monkeypatch
+):
+    """A vulnerable web panel on a host that also answers RTSP must not stop
+    the credential brute-force: only a confirmed RTSP stream ends stage 3."""
+    from CamReaper import cve as cve_mod
+    from tests.mock_http import make_server
+    from tests.mock_rtsp import make_server as make_rtsp
+
+    rtsp = await make_rtsp("scanner", valid_cred="admin:admin", server_header="Hikvision")
+    http = await make_server({
+        "/SDK/config": (200, "<Configuration>Hikvision panel</Configuration>"),
+        "/": (200, "Hikvision web"),
+    })
+    report.HTTP_CVE_FILE = tmp_path / "http_cve.txt"
+    report.HTTP_CVE_FILE.touch()
+    report.CVE_LOG_FILE = None
+    try:
+        db = CVEDatabase(sample_db)
+
+        async def targets():
+            yield rtsp.host
+
+        settings = Settings(
+            ports=[rtsp.port],
+            routes=["/"],
+            credentials=["admin:admin"],
+            timeout=1.0,
+            host_concurrency=1,
+            screenshot_concurrency=1,
+            enable_screenshots=False,
+            mode="combined",
+            cve_db=db,
+            http_ports=[http.port],
+        )
+        stats = await run(targets(), settings)
+        # The HTTP panel is vulnerable...
+        assert stats["http_found"] == 1
+        # ...and the plain credential still opens RTSP, because stage 3 fell
+        # through to the brute-force.
+        assert stats["found"] == 1
+        assert stats["cve_found"] == 0, "an HTTP hit is not a CVE-found stream"
+        assert "admin:admin@127.0.0.1" in report_paths.read_text()
+    finally:
+        await rtsp.stop()
+        await http.stop()
+        report.HTTP_CVE_FILE = None
+
+
+async def test_rtsp_cve_hit_still_stops_the_host(report_paths, sample_db, tmp_path):
+    """A backdoor credential that opens RTSP ends the host pipeline: the
+    brute-force is skipped and the hit is counted as a CVE stream."""
+    from tests.mock_rtsp import make_server
+
+    rtsp = await make_server(
+        "scanner", valid_cred="admin:Hik@2014", server_header="Hikvision"
+    )
+    report.CVE_LOG_FILE = None
+    try:
+        db = CVEDatabase(sample_db)
+
+        async def targets():
+            yield rtsp.host
+
+        settings = Settings(
+            ports=[rtsp.port],
+            routes=["/"],
+            credentials=["admin:admin"],
+            timeout=1.0,
+            host_concurrency=1,
+            screenshot_concurrency=1,
+            enable_screenshots=False,
+            mode="combined",
+            cve_db=db,
+        )
+        stats = await run(targets(), settings)
+        assert stats["found"] == 1
+        assert stats["cve_found"] == 1
+        assert stats["http_found"] == 0
+        assert "admin:Hik@2014@127.0.0.1" in report_paths.read_text()
+    finally:
+        await rtsp.stop()

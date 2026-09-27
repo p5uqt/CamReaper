@@ -8,6 +8,7 @@ crash loses at most a few thousand lines.
 """
 
 import asyncio
+import html
 import json
 import re
 import shutil
@@ -28,7 +29,25 @@ CVE_LOG_FILE: Optional[Path] = (
 HTTP_CVE_FILE: Optional[Path] = (
     None  # set by __main__ to log HTTP CVE-probe hits (non-RTSP)
 )
-_lock = asyncio.Lock()
+_locks: Dict[object, asyncio.Lock] = {}
+
+
+def _get_lock() -> asyncio.Lock:
+    """Return the write lock of the *running* event loop.
+
+    A single module-level ``asyncio.Lock()`` binds itself to the first loop that
+    waits on it (Python < 3.10), so a second run - or the test suite, which
+    creates a fresh loop per test - would fail with "Future attached to a
+    different loop".  One lock per loop keeps every writer safe without that
+    cross-loop landmine.
+    """
+    loop = asyncio.get_running_loop()
+    lock = _locks.get(loop)
+    if lock is None:
+        lock = _locks[loop] = asyncio.Lock()
+    return lock
+
+
 # path -> handle of the currently open file, kept across writes.
 _handles: Dict[Path, object] = {}
 # path -> list of pending strings not yet flushed to disk.
@@ -151,14 +170,14 @@ async def _append(path: Optional[Path], text: str) -> None:
     if path is None:
         return
     buf = _buffers.setdefault(path, [])
-    async with _lock:
+    async with _get_lock():
         buf.append(text)
         if len(buf) >= _FLUSH_LINES:
             _flush_buffers([path])
 
 
 def _flush_buffers(paths) -> None:
-    """Flush the given paths' buffers to disk (caller must hold ``_lock``)."""
+    """Flush the given paths' buffers to disk (caller must hold the lock)."""
     for p in paths:
         buf = _buffers.get(p)
         if not buf:
@@ -237,20 +256,20 @@ async def record_gallery(url: str, pic_rel: str) -> None:
     """Append a gallery entry to index.html for a successful screenshot."""
     if HTML_FILE is None:
         return
-    await _append(
-        HTML_FILE,
-        '<div class="responsive"><div class="gallery">\n'
-        f'<img src="{pic_rel}" alt="{url}" width="600" height="400" '
-        'loading="lazy" onclick="clickOrDouble(this,event)">'
-        '<p style="font-size:11px;margin:2px">click: copy &middot; '
-        "double click: fullscreen</p></div></div>\n\n",
-    )
+    await _append(HTML_FILE, _gallery_entry(url, pic_rel) + "\n")
 
 
 def _gallery_entry(url: str, pic_rel: str) -> str:
+    # RTSP URLs are full of '&' (ONVIF query routes) and a password may hold a
+    # quote, so both attributes have to be HTML-escaped - unescaped they break
+    # the markup and let a URL inject attributes into the page.  (escape_chars
+    # would be wrong here: it rewrites the value instead of quoting it, which
+    # would break the real src path.)
     return (
         '<div class="responsive"><div class="gallery">\n'
-        f'<img src="{pic_rel}" alt="{url}" width="600" height="400" '
+        f'<img src="{html.escape(str(pic_rel), quote=True)}" '
+        f'alt="{html.escape(str(url), quote=True)}" '
+        'width="600" height="400" '
         'loading="lazy" onclick="clickOrDouble(this,event)">'
         '<p style="font-size:11px;margin:2px">click: copy &middot; '
         "double click: fullscreen</p></div></div>\n"
@@ -313,7 +332,7 @@ async def write_gallery_sections(entries, path: Optional[Path] = None) -> None:
                 buf.append("</div><!-- /camgroup -->\n")
             buf.append(
                 f'<div class="camgroup">\n<div class="cam-head">'
-                f"{_gallery_label(url)}</div>\n"
+                f'{html.escape(_gallery_label(url), quote=True)}</div>\n'
             )
             prev = base
             open_group = True
@@ -325,7 +344,7 @@ async def write_gallery_sections(entries, path: Optional[Path] = None) -> None:
 
 async def close_report_files() -> None:
     """Flush and close every open output writer (call once at shutdown)."""
-    async with _lock:
+    async with _get_lock():
         # Ensure every configured output file exists even if nothing was
         # buffered for it yet (buffering defers file creation to first flush).
         for path in (RESULT_FILE, HTML_FILE, FAILED_FILE, NO_AUTH_FILE,
@@ -357,7 +376,7 @@ def start_flush_task(interval: float = 10.0):
         try:
             while True:
                 await asyncio.sleep(interval)
-                async with _lock:
+                async with _get_lock():
                     _flush_buffers(list(_buffers.keys()))
         except asyncio.CancelledError:
             pass
@@ -384,12 +403,17 @@ def write_summary(path: Path, stats: dict, elapsed: float = 0.0) -> None:
         "statistics": {
             k: stats.get(k, 0)
             for k in ("checked", "found", "screenshots", "found_no_frame",
-                      "cve_found", "cve_tested", "http_checked", "http_found")
+                      "cve_found", "cve_tested", "http_checked", "http_found",
+                      "errors")
         },
         "vendors": stats.get("vendors", {}),
         "ports": stats.get("ports", {}),
         "mode": stats.get("mode", "brute"),
     }
+    if stats.get("error_samples"):
+        # Kept verbatim (and bounded by the scanner) so a run that found less
+        # than expected can be explained from summary.json alone.
+        data["error_samples"] = list(stats["error_samples"])[:5]
     try:
         path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     except OSError:

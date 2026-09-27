@@ -9,7 +9,9 @@ Scans networks for RTSP camera streams, brute-forces routes and credentials, cap
 ## Features
 
 - **Async architecture** - asyncio event loop with bounded concurrency, no blocking threads. See the Russian documentation [README.ru.md](README.ru.md) for the localized version.
-- **Route discovery** - parallel route probing across 810+ vendor paths (ONVIF, Dahua, Hikvision, Uniview, Axis, Samsung, Panasonic, Tapo, etc.)
+- **Route discovery** - parallel route probing across the built-in list of common vendor paths (ONVIF, Dahua, Hikvision, Uniview, Axis, Samsung, Panasonic, Tapo, etc.). Larger community lists are shipped in `routecreds/` (e.g. `routecreds/routes.txt`, 810+ paths) and can be passed with `-r`
+- **Parallel port probing** - the `-p` ports of a host are probed concurrently (4 at a time), so a multi-port scan is no longer serial. The port of record is still the first responsive port in the order you gave
+- **Lazily expanded targets** - IPs, CIDRs and ranges are generated on the fly, so `-t 10.0.0.0/8` costs no memory; a host-prefixed CIDR such as `192.168.1.5/24` is accepted and resolved to the containing network
 - **Credential brute-force** - Basic and Digest (two-step) authentication
 - **Screenshots** - FFmpeg-based capture with hard timeout (subprocess isolation)
 - **HTML gallery** - click to copy RTSP URL, double-click for fullscreen
@@ -67,7 +69,7 @@ CamReaper [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-p, --ports PORTS` | `554` | RTSP ports to scan; ranges allowed (`8000-8008`) |
+| `-p, --ports PORTS` | `554` | RTSP ports to scan; ranges allowed (`8000-8008`); probed 4 at a time per host, first responsive port wins |
 | `-r, --routes FILE` | built-in | Custom route list |
 | `-c, --credentials FILE` | built-in | Credential list (`user:pass` per line) |
 | `-ct, --check-concurrency N` | `300` | Max concurrent host pipelines |
@@ -204,8 +206,11 @@ One entry per line. Supported formats:
 ```
 192.168.1.100
 192.168.1.0/24
+192.168.1.5/24          # host-prefixed CIDR, resolved to 192.168.1.0/24
 10.0.0.1 - 10.0.0.254
 ```
+
+Blank lines and lines starting with `#` are ignored in every input file.
 
 ### Routes file
 
@@ -229,6 +234,9 @@ root:root
 admin:12345
 ```
 
+The password may be empty (`admin:`) and may contain non-ASCII characters. A line without
+a `:` is treated as a login with an empty password instead of aborting the run.
+
 ---
 
 ## Output
@@ -239,7 +247,7 @@ Each run creates a timestamped folder under `reports/<timestamp>/`:
 |------|-------------|
 | `result.txt` | Confirmed stream URLs (one per line) |
 | `streams.m3u` | Same URLs as M3U playlist (open in VLC) |
-| `summary.json` | Statistics: checked, found, screenshots, vendor/port breakdown |
+| `summary.json` | Statistics: checked, found, screenshots, cve/http counters, host errors, vendor/port breakdown |
 | `pics/` | Captured screenshots |
 | `index.html` | Interactive gallery with click-to-copy and fullscreen |
 | `checkpoint.json` | Resume state (if `--checkpoint` was used) |

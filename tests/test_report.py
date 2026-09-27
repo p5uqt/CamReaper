@@ -36,6 +36,40 @@ async def test_record_gallery(paths):
     assert 'href="rtsp://1.2.3.4:554/"' not in content
 
 
+async def test_record_gallery_escapes_attributes(paths):
+    """A URL with '&' or a quote must not break (or inject into) the markup."""
+    _, html = paths
+    await report.record_gallery(
+        'rtsp://a"b:c@1.2.3.4:554/cam?channel=1&subtype=1', "pics/1.2.3.4.jpg"
+    )
+    await report.close_report_files()
+    content = html.read_text()
+    assert 'src="pics/1.2.3.4.jpg"' in content
+    assert "&amp;subtype=1" in content
+    assert "&quot;" in content
+    assert 'alt="rtsp://a"b' not in content
+
+
+def test_writers_work_on_a_second_event_loop(tmp_path):
+    """A module-level asyncio.Lock would bind to the first loop and break every
+    later run; the writers must be usable from any loop."""
+    import asyncio
+
+    result = tmp_path / "result.txt"
+    report.RESULT_FILE = result
+
+    async def _write(tag):
+        await report.record_url(f"rtsp://10.0.0.{tag}:554/")
+        await report.close_report_files()
+
+    try:
+        asyncio.run(_write(0))
+        asyncio.run(_write(1))
+    finally:
+        report.RESULT_FILE = None
+    assert result.read_text() == "rtsp://10.0.0.0:554/\nrtsp://10.0.0.1:554/\n"
+
+
 def test_escape_chars():
     assert (
         report.escape_chars("rtsp://1.2.3.4:554/a b_-.x")
@@ -73,7 +107,29 @@ def test_write_summary(tmp_path):
             "cve_tested": 0,
             "http_checked": 0,
             "http_found": 0,
+            "errors": 0,
         }
     assert data["vendors"] == {"Hikvision": 2, "Generic": 1}
     assert data["ports"] == {"554": 3}
     assert data["mode"] == "brute"
+
+
+def test_summary_keeps_error_samples(tmp_path):
+    """error_samples must reach summary.json - it is the only place a silently
+    dropped host can be explained from after the fact."""
+    report.RESULT_FILE = None
+    report.HTML_FILE = None
+    summary = tmp_path / "summary.json"
+    report.write_summary(
+        summary,
+        {
+            "checked": 3, "found": 0, "screenshots": 0, "found_no_frame": 0,
+            "cve_found": 0, "cve_tested": 0, "http_checked": 0, "http_found": 0,
+            "errors": 1,
+            "error_samples": ["10.0.0.1: TypeError: boom"],
+        },
+        1.0,
+    )
+    data = json.loads(summary.read_text())
+    assert data["error_samples"] == ["10.0.0.1: TypeError: boom"]
+    assert data["statistics"]["errors"] == 1

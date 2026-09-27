@@ -19,6 +19,23 @@ def _load_lines(path: Path):
     return path.read_text(encoding="utf-8").splitlines()
 
 
+def _load_list(path: Path) -> list:
+    """Load a wordlist (routes / credentials), dropping blanks and comments.
+
+    A trailing empty line - the norm in every hand-edited list - used to become
+    a route "" or, worse, a credential ""; the empty credential then reached
+    the Digest/Basic auth code and could take down the whole scan.  Comments
+    (``#``) are stripped too, so a list can be annotated.
+    """
+    out = []
+    for raw in _load_lines(path):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        out.append(line)
+    return out
+
+
 def _c(text, code="36"):
     """ANSI-color ``text`` for the terminal (no color when not a TTY)."""
     if not sys.stdout.isatty():
@@ -177,7 +194,7 @@ def _capture_from_results(results_file: Path, args) -> None:
             disable=not tty,
         )
         sem = asyncio.Semaphore(concurrency)
-        pics: list = []
+        pics: dict = {}
         done = 0
 
         async def _one(url: str):
@@ -185,9 +202,7 @@ def _capture_from_results(results_file: Path, args) -> None:
             async with sem:
                 pic = await screenshot.capture(url, images_dir, timeout)
             if pic:
-                entry = (url, f"images/{Path(pic).name}")
-                if entry not in pics:
-                    pics.append(entry)
+                pics[url] = f"images/{Path(pic).name}"
             done += 1
             if bar.total is None:
                 bar.total = len(urls)
@@ -196,8 +211,8 @@ def _capture_from_results(results_file: Path, args) -> None:
 
         try:
             tasks = [asyncio.create_task(_one(u)) for u in urls]
-            await asyncio.gather(*tasks)
-            await report.write_gallery_sections(pics, report.HTML_FILE)
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await report.write_gallery_sections(list(pics.items()), report.HTML_FILE)
             return len(pics)
         finally:
             bar.close()
@@ -207,10 +222,9 @@ def _capture_from_results(results_file: Path, args) -> None:
 
     t0 = time.monotonic()
     shots = asyncio.run(_run())
-    actual_shots = len(list(images_dir.glob("*.jpg")))
     print(
         _c(
-            f"[done] capture: {actual_shots}/{len(urls)} screenshot(s) taken in "
+            f"[done] capture: {shots}/{len(urls)} screenshot(s) taken in "
             f"{time.monotonic() - t0:.1f}s",
             "32",
         )
@@ -245,7 +259,11 @@ def main():
     # Channel-probing route list used by --scan-channels / --gallery-html to
     # discover every open stream of a confirmed camera (the channels the scan
     # stored only as a bare root "/").  Independent of the main scan's -r.
-    scan_routes = _load_lines(args.scan_routes)
+    # Loaded only when one of those modes is actually requested: a plain brute
+    # scan never looks at it.
+    scan_routes = _load_list(args.scan_routes) if (
+        args.scan_channels or args.gallery_html is not None
+    ) else []
 
     # Gallery-only mode: build the site from a supplied list of rtsp:// URLs,
     # no scanning at all.
@@ -290,6 +308,12 @@ def main():
                     route_parallel=args.route_parallel,
                     progress=progress,
                 )
+                # The gallery's input *is* its stream list: record it so
+                # result.txt and streams.m3u carry the URLs instead of staying
+                # empty (the mode reports found=len(urls), so the files must
+                # match).  Written before the writers are closed below.
+                for url in urls:
+                    await report.record_url(url)
                 bar.close()
                 return shots
             except BaseException:
@@ -310,6 +334,8 @@ def main():
             "found_no_frame": len(urls) - shots,
             "vendors": {},
             "ports": {},
+            "errors": 0,
+            "mode": "gallery",
         }
         report.write_summary(
             report_folder / "summary.json", stats, time.monotonic() - t0
@@ -328,17 +354,19 @@ def main():
     # nothing; only reachable-but-unconfirmed hosts are logged (never the
     # millions of closed TCP ports), so it never slows the scan.  With no value
     # the file lands in the report folder next to result.txt.
-    failed_file = None
+    # (report.FAILED_FILE / NO_AUTH_FILE are what the scanner's report layer
+    # reads - they are wired here, not passed through Settings.)
     if args.failed_file is not None:
-        failed_file = _resolve_log_path(args.failed_file, report_folder, "failed.txt")
-        report.FAILED_FILE = failed_file
+        report.FAILED_FILE = _resolve_log_path(
+            args.failed_file, report_folder, "failed.txt"
+        )
         report.FAILED_FILE.touch()
 
     # Optional "no credential worked" log for confirmed live RTSP hosts.
-    no_auth_file = None
     if args.no_auth_file is not None:
-        no_auth_file = _resolve_log_path(args.no_auth_file, report_folder, "noauth.txt")
-        report.NO_AUTH_FILE = no_auth_file
+        report.NO_AUTH_FILE = _resolve_log_path(
+            args.no_auth_file, report_folder, "noauth.txt"
+        )
         report.NO_AUTH_FILE.touch()
 
     # Optional CVE exploit log.
@@ -403,8 +431,8 @@ def main():
         print(_c(f"[info] open-file limit: {fd_limit}"))
 
     ports = args.ports
-    routes = _load_lines(args.routes)
-    credentials = _load_lines(args.credentials)
+    routes = _load_list(args.routes)
+    credentials = _load_list(args.credentials)
 
     # Load CVE database if scan mode requires it.
     cve_db = None
@@ -462,9 +490,7 @@ def main():
         max_transport_fails=args.max_transport_fails,
         attempts_per_sec=args.attempts_per_sec,
         host_timeout=args.host_timeout,
-        failed_file=failed_file,
         failed_with_error=args.failed_with_error,
-        no_auth_file=no_auth_file,
         route_parallel=args.route_parallel,
         mode=args.mode,
         cve_db=cve_db,
@@ -485,6 +511,8 @@ def main():
         "cve_tested": 0,
         "http_checked": 0,
         "http_found": 0,
+        "errors": 0,
+        "error_samples": [],
         "mode": args.mode,
     }
     base = resumed_stats or {
@@ -504,6 +532,8 @@ def main():
             "cve_tested": stats["cve_tested"],
             "http_checked": stats["http_checked"],
             "http_found": stats["http_found"],
+            "errors": stats["errors"],
+            "error_samples": list(stats.get("error_samples", ())),
         }
 
     # Compose the (possibly deduped) scan iterator.  The original targets Path is
@@ -531,8 +561,10 @@ def main():
             checked.add(ip)
             pending_ips.append(ip)
         for k in ("checked", "found", "screenshots", "found_no_frame",
-                  "cve_found", "cve_tested", "http_checked", "http_found"):
+                  "cve_found", "cve_tested", "http_checked", "http_found",
+                  "errors"):
             stats[k] = current[k]
+        stats["error_samples"] = list(current.get("error_samples", ()))
         stats["vendors"] = current["vendors"]
         stats["ports"] = current["ports"]
         pbar.update(1)
@@ -665,14 +697,22 @@ def main():
             )
 
     dt = time.monotonic() - t0
+    final = merged()
     print()
     print(
         _c(
-            f"[done] checked={merged()['checked']} found={merged()['found']} "
-            f"screenshots={merged()['screenshots']} in {dt:.1f}s",
+            f"[done] checked={final['checked']} found={final['found']} "
+            f"screenshots={final['screenshots']} in {dt:.1f}s",
             "32",
         )
     )
+    if final["errors"]:
+        # Host pipelines that raised are counted, not fatal: surface the number
+        # instead of pretending the run was clean - every one of them is a host
+        # that produced no findings.
+        print(_c(f"[warn] {final['errors']} host(s) errored during the scan", "33"))
+        for sample in final.get("error_samples", [])[:5]:
+            print(_c(f"[warn]   {sample}", "33"))
     print(_c(f"[done] report: {report_folder}"))
 
 

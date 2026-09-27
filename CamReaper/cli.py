@@ -62,19 +62,25 @@ class PortList(argparse.Action):
     A range spec such as ``8000-8008`` expands to several ports, so the specs
     are flattened here, keeping the order the user asked for and dropping
     duplicates.  Bad specs are reported as a normal argparse error.
+
+    Membership is tracked in a set: ``"1-65535" not in ports`` is a linear scan
+    of the whole list, which made the full port range take ~18s of pure CPU
+    before the scan even started.
     """
 
     def __call__(self, parser, namespace, values, option_string=None):
         if isinstance(values, (str, bytes)):
             values = [values]
         ports: list = []
+        seen: set = set()
         for value in values:
             try:
                 expanded = port(value)
             except argparse.ArgumentTypeError as exc:
                 parser.error(f"argument {option_string or self.dest}: {exc}")
             for number in expanded:
-                if number not in ports:
+                if number not in seen:
+                    seen.add(number)
                     ports.append(number)
         setattr(namespace, self.dest, ports)
 

@@ -17,7 +17,9 @@ from enum import Enum
 # Read `User-Agent` / WWW-Authenticate headers up to this many bytes at most.
 MAX_HEADER_BYTES = 64 * 1024
 
-_STATUS_RE = re.compile(rb"RTSP/(\d+\.\d+) (\d{3})")
+_STATUS_RE = re.compile(r"RTSP/(\d+\.\d+) (\d{3})")
+_REALM_RE = re.compile(r'realm="([^"]*)"', re.IGNORECASE)
+_NONCE_RE = re.compile(r'nonce="([^"]*)"', re.IGNORECASE)
 
 
 class Status(Enum):
@@ -40,6 +42,7 @@ class RTSPClient:
         "nonce",
         "cseq",
         "data",
+        "last_error",
     )
 
     def __init__(
@@ -56,6 +59,9 @@ class RTSPClient:
         self.nonce = ""
         self.cseq = 0
         self.data = ""
+        # Why the last attempt failed ("timeout", "closed", "refused", ...);
+        # kept across close() so the scanner can report an accurate reason.
+        self.last_error = ""
 
     # ------------------------------------------------------------------ I/O
 
@@ -64,9 +70,12 @@ class RTSPClient:
         if port is None:
             port = self.port
 
-        if self.writer is not None and not self.writer.is_closing():
+        if (
+            self.writer is not None
+            and not self.writer.is_closing()
+            and port == self.port
+        ):
             # Already have a live connection on this port - reuse it.
-            self.port = port
             self.status = Status.CONNECTED
             return True
 
@@ -78,16 +87,19 @@ class RTSPClient:
             self.reader, self.writer = await asyncio.wait_for(
                 asyncio.open_connection(self.ip, port), timeout=self.timeout
             )
-        except (asyncio.TimeoutError, OSError):
+        except (asyncio.TimeoutError, OSError) as exc:
             self.status = Status.TIMEOUT
+            self.last_error = "timeout" if isinstance(exc, asyncio.TimeoutError) else "refused"
             self.reader = self.writer = None
             return False
         except Exception:
             self.status = Status.UNIDENTIFIED
+            self.last_error = "error"
             self.reader = self.writer = None
             return False
 
         self.status = Status.CONNECTED
+        self.last_error = ""
         return True
 
     def close(self) -> None:
@@ -113,7 +125,8 @@ class RTSPClient:
         """Read RTSP headers (up to ``\r\n\r\n``) into ``self.data``.
 
         Raises ConnectionError if the peer closed before sending a complete
-        header block, so the caller can drop this socket and retry.
+        header block, so the caller can drop this socket and retry.  The reason
+        is recorded in ``self.last_error`` for the scanner's failure log.
         """
         head = bytearray()
         while b"\r\n\r\n" not in head:
@@ -122,11 +135,14 @@ class RTSPClient:
                     self.reader.read(4096), timeout=self.timeout
                 )
             except asyncio.TimeoutError:
-                raise ConnectionError("timed out reading response")
+                self.last_error = "timeout"
+                raise ConnectionError("timed out reading response") from None
             if not chunk:
+                self.last_error = "closed"
                 raise ConnectionError("connection closed early")
             head += chunk
             if len(head) > MAX_HEADER_BYTES:
+                self.last_error = "headers-too-large"
                 raise ConnectionError("response headers too large")
         self.data = bytes(head).decode("utf-8", errors="replace")
 
@@ -142,8 +158,8 @@ class RTSPClient:
     @property
     def status_code(self) -> str:
         """Three-digit status code, e.g. ``"200"``, or ``""`` if unknown."""
-        m = _STATUS_RE.search(self.status_line.encode("utf-8", "replace"))
-        return m.group(2).decode() if m else ""
+        m = _STATUS_RE.search(self.status_line)
+        return m.group(2) if m else ""
 
     # ---------------------------------------------------------------- auth
 
@@ -191,19 +207,33 @@ class RTSPClient:
         from CamReaper.packet import describe
 
         self.cseq += 1
-        request = describe(
-            self.ip, port, route, self.cseq, credentials, self.realm, self.nonce
-        )
+        self.last_error = ""
         try:
-            self.writer.write(request.encode())
+            # Built inside the guard: a malformed credential / route must never
+            # escape as an exception and abort the whole scan.
+            request = describe(
+                self.ip, port, route, self.cseq, credentials, self.realm, self.nonce
+            )
+            self.writer.write(request.encode("utf-8", "replace"))
             await asyncio.wait_for(self.writer.drain(), timeout=self.timeout)
             await self._read_response()
-        except (ConnectionError, asyncio.TimeoutError, OSError):
+        except (ConnectionError, asyncio.TimeoutError, OSError) as exc:
             # Fresh connection needed: the camera dropped the socket (common).
+            # _read_response already recorded the precise reason before raising
+            # ("closed" / "timeout" / "headers-too-large"); fill in only what it
+            # could not know, e.g. a write/drain timeout.
+            if not self.last_error:
+                if isinstance(exc, asyncio.TimeoutError):
+                    self.last_error = "timeout"
+                elif isinstance(exc, ConnectionError):
+                    self.last_error = "closed"
+                else:
+                    self.last_error = "refused"
             self.close()
             return False
         except Exception:
             self.close()
+            self.last_error = "error"
             return False
 
         realm, nonce = self._extract_challenge(self.data)
@@ -216,21 +246,15 @@ class RTSPClient:
     @staticmethod
     def _extract_challenge(data: str):
         """Pull realm/nonce from a WWW-Authenticate header, if present."""
-        realm = nonce = None
-        m = re.search(r'realm="([^"]*)"', data, re.IGNORECASE)
-        if m:
-            realm = m.group(1)
-        m = re.search(r'nonce="([^"]*)"', data, re.IGNORECASE)
-        if m:
-            nonce = m.group(1)
+        m = _REALM_RE.search(data)
+        realm = m.group(1) if m else None
+        m = _NONCE_RE.search(data)
+        nonce = m.group(1) if m else None
         return realm, nonce
 
     # --------------------------------------------------------------- meta
 
     @staticmethod
     def get_rtsp_url(ip, port=554, credentials=":", route="/") -> str:
-        prefix = f"{credentials}@" if credentials != ":" else ""
+        prefix = f"{credentials}@" if credentials and credentials != ":" else ""
         return f"rtsp://{prefix}{ip}:{port}{route}"
-
-    def __str__(self) -> str:
-        return self.get_rtsp_url(self.ip, self.port, self.credentials, "/")

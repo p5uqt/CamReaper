@@ -214,7 +214,7 @@ async def test_failed_file_records_unconfirmed_host(report_paths, tmp_path):
     report.FAILED_FILE = failed
     srv = await make_server("silent")
     try:
-        await _scan(srv, creds=["admin:admin"], failed_file=failed)
+        await _scan(srv, creds=["admin:admin"])
         lines = failed.read_text().splitlines()
         assert len(lines) == 1
         parts = lines[0].split()
@@ -237,7 +237,6 @@ async def test_failed_file_with_error_appends_reason(report_paths, tmp_path):
         await _scan(
             srv,
             creds=["admin:admin"],
-            failed_file=failed,
             failed_with_error=True,
         )
         parts = failed.read_text().splitlines()[0].split()
@@ -272,7 +271,7 @@ async def test_no_auth_file_records_unopened_camera(report_paths, tmp_path):
     report.NO_AUTH_FILE = noauth
     srv = await make_server("scanner", valid_cred="root:secret")
     try:
-        stats = await _scan(srv, creds=["admin:admin"], no_auth_file=noauth)
+        stats = await _scan(srv, creds=["admin:admin"])
         assert stats["found"] == 0
         lines = noauth.read_text().splitlines()
         assert len(lines) == 1
@@ -294,7 +293,7 @@ async def test_no_auth_file_not_written_when_cred_works(report_paths, tmp_path):
     noauth.touch()  # __main__ creates the file up front
     srv = await make_server("scanner", valid_cred="admin:admin")
     try:
-        stats = await _scan(srv, creds=["admin:admin"], no_auth_file=noauth)
+        stats = await _scan(srv, creds=["admin:admin"])
         assert stats["found"] == 1
         assert noauth.read_text() == ""
     finally:
@@ -459,3 +458,185 @@ async def test_status_hook_fires(report_paths):
         assert stats["checked"] == 1
     finally:
         await srv.stop()
+
+
+async def test_open_port_found_among_several(report_paths):
+    """Ports of one host are probed concurrently; the live one still wins and
+    the result is the same as probing them one by one."""
+    from tests.mock_rtsp import make_server
+
+    open_srv = await make_server("open")
+    try:
+        # Dead ports first (connection refused) so the winner is not the first.
+        dead = [65400, 65401, 65402]
+        settings_ports = dead + [open_srv.port]
+
+        async def targets():
+            yield open_srv.host
+
+        settings = Settings(
+            ports=settings_ports,
+            routes=["/"],
+            credentials=[],
+            timeout=1.0,
+            host_concurrency=1,
+            screenshot_concurrency=1,
+            enable_screenshots=False,
+        )
+        stats = await run(targets(), settings)
+        assert stats["found"] == 1
+        assert stats["ports"] == {str(open_srv.port): 1}
+    finally:
+        await open_srv.stop()
+
+
+async def test_first_responsive_port_wins_regardless_of_order(report_paths):
+    """An auth-port earlier in the list is the host's port of record, even when
+    a later port is open - the port order is the user's explicit choice."""
+    from tests.mock_rtsp import make_server
+
+    auth_srv = await make_server("auth", valid_cred="root:secret")
+    try:
+        async def targets():
+            yield auth_srv.host
+
+        settings = Settings(
+            ports=[auth_srv.port, 65403],
+            routes=["/"],
+            credentials=[],
+            timeout=1.0,
+            host_concurrency=1,
+            screenshot_concurrency=1,
+            enable_screenshots=False,
+            max_attempts=1,
+        )
+        stats = await run(targets(), settings)
+        assert stats["found"] == 0  # no credential opens it
+    finally:
+        await auth_srv.stop()
+
+
+async def test_host_error_does_not_kill_the_scan(report_paths, monkeypatch):
+    """A pipeline that raises must cost that one host, not the whole run."""
+    from CamReaper import scanner
+    from tests.mock_rtsp import make_server
+
+    srv = await make_server("open")
+    original = scanner._handle_host
+    calls = []
+
+    async def _boom(ip, s, stats=None):
+        calls.append(ip)
+        if len(calls) == 1:
+            raise RuntimeError("host pipeline exploded")
+        return await original(ip, s, stats)
+
+    monkeypatch.setattr(scanner, "_handle_host", _boom)
+    try:
+        async def targets():
+            yield srv.host
+            yield "127.0.0.2"
+
+        settings = Settings(
+            ports=[srv.port],
+            routes=["/"],
+            credentials=[],
+            timeout=1.0,
+            host_concurrency=2,
+            screenshot_concurrency=1,
+            enable_screenshots=False,
+        )
+        stats = await run(targets(), settings)
+        assert stats["checked"] == 2, "the failed host still counts as checked"
+        assert stats["errors"] == 1
+    finally:
+        await srv.stop()
+
+
+async def test_open_route_survives_closed_routes(report_paths):
+    """A camera that answers a wrong route by hanging up on the socket - with
+    no RTSP reply at all - must not make the sweep give up.  Regression: the
+    stripe/serial sweep used to count that as a transport failure and abandon
+    the remaining routes, so a stream served only under a late (query) route
+    was never found.  The long list matters: with few routes every stripe gets
+    a single route and the early bail-out cannot trigger."""
+    from tests.mock_rtsp import make_server
+
+    open_route = "/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif"
+    srv = await make_server(
+        "route-open", open_route=open_route, close_on_unknown=True
+    )
+    try:
+        routes = [f"/path{i}" for i in range(24)] + ["/", open_route]
+        stats = await _scan(srv, creds=["admin:admin"], routes=routes)
+        assert stats["found"] == 1
+        assert open_route in report_paths.read_text()
+    finally:
+        await srv.stop()
+
+
+async def test_open_route_survives_closed_routes_serial(report_paths):
+    """Same camera, serial sweep (--route-parallel 0)."""
+    from tests.mock_rtsp import make_server
+
+    open_route = "/h264/ch1/main/av_stream"
+    srv = await make_server(
+        "route-open", open_route=open_route, close_on_unknown=True
+    )
+    try:
+        routes = [f"/path{i}" for i in range(12)] + ["/", open_route]
+        stats = await _scan(
+            srv, creds=["admin:admin"], routes=routes, route_parallel=0
+        )
+        assert stats["found"] == 1
+        assert open_route in report_paths.read_text()
+    finally:
+        await srv.stop()
+
+
+async def test_credentials_survive_a_camera_that_hangs_up(report_paths):
+    """A camera that drops the socket after every request must still be opened
+    by a later credential in the list - bailing out on the first hang-up used to
+    cut the brute-force short after one or two tries."""
+    from tests.mock_rtsp import make_server
+
+    srv = await make_server(
+        "named-route-auth",
+        open_route="/stream1",
+        close_on_unknown=True,
+    )
+    try:
+        creds = ["a:1", "b:2", "c:3", "admin:admin", "d:4", "e:5"]
+        stats = await _scan(srv, creds=creds, routes=("/", "/stream1"))
+        assert stats["found"] == 1
+        assert "admin:admin@" in report_paths.read_text()
+    finally:
+        await srv.stop()
+
+
+async def test_error_samples_are_kept_for_diagnosis(report_paths, monkeypatch):
+    """A host that raises must be counted AND described: a swallowed exception
+    is a host that silently produced no findings."""
+    from CamReaper import scanner
+
+    async def _boom(ip, s, stats=None):
+        raise ValueError("nope")
+
+    monkeypatch.setattr(scanner, "_handle_host", _boom)
+
+    async def targets():
+        yield "127.0.0.9"
+
+    settings = Settings(
+        ports=[1],
+        routes=["/"],
+        credentials=[],
+        timeout=0.2,
+        host_concurrency=1,
+        screenshot_concurrency=1,
+        enable_screenshots=False,
+    )
+    stats = await run(targets(), settings)
+    assert stats["checked"] == 1
+    assert stats["errors"] == 1
+    assert stats["error_samples"] == ["127.0.0.9: ValueError: nope"]

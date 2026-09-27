@@ -24,6 +24,9 @@ _MAX_DAHUA_CH = 8
 
 _RE_DAHUA_CH = re.compile(r"/h264/ch(\d+)/main/av_stream")
 _RE_ONVIF_CH = re.compile(r"channel=(\d+)")
+# The subtype that a variant fills in, so an existing one has to be cut out of
+# the tail first - otherwise every variant is "?channel=N&subtype=0&subtype=1".
+_RE_SUBTYPE = re.compile(r"&?subtype=\d+")
 # A route/URL is ONVIF when it carries a channel/subtype parameter or a
 # realmonitor/.sdp path.  Probing is kept ONVIF-scoped, so non-ONVIF cameras
 # never pick up unrelated route aliases (which was causing duplicate shots).
@@ -39,7 +42,7 @@ def _split_url(url: str):
     present, else ``":"`` (no auth).  ``port`` defaults to 554, ``route`` to
     ``/``.
     """
-    s = url.replace("rtsp://", "", 1)
+    s = url[len("rtsp://"):] if url.lower().startswith("rtsp://") else url
     authority, sep, route = s.partition("/")
     route = "/" + route if sep else "/"
     userinfo = ""
@@ -60,7 +63,12 @@ def _split_url(url: str):
 async def _probe_host_routes(host, port, creds, routes, route_parallel):
     """Probe ``routes`` on one camera; return the list of open routes."""
     client = RTSPClient(host, port, 2.0, creds)
-    return await probe_all_routes(client, routes, creds, route_parallel)
+    try:
+        return await probe_all_routes(client, routes, creds, route_parallel)
+    finally:
+        # probe_all_routes works off the coordinates only, but the client still
+        # owns a socket: never leave it dangling per camera.
+        client.close()
 
 
 async def build_probed_urls(urls, routes, route_parallel: int = 0):
@@ -142,7 +150,9 @@ def channel_variants(url: str):
         # ?channel=N&subtype=T  ->  channel 1..8 x subtype 0..1 (main+sub)
         start, end = m.start(), m.end()  # the "channel=N" span
         prefix = url[:start]
-        suffix = url[end:]
+        # Drop the original subtype: leaving it in place produced URLs with
+        # two subtype parameters ("subtype=0&subtype=1"), i.e. a bogus route.
+        suffix = _RE_SUBTYPE.sub("", url[end:], count=1)
         for n in range(1, _MAX_DAHUA_CH + 1):
             for sub in (0, 1):
                 yield f"{prefix}channel={n}&subtype={sub}{suffix}"
@@ -193,16 +203,24 @@ async def build_from_urls(
             await progress(done, total)
 
     tasks = [asyncio.create_task(_one(v)) for v in candidates]
-    await asyncio.gather(*tasks)
+    # One failing candidate must not cost the whole gallery.
+    await asyncio.gather(*tasks, return_exceptions=True)
     await report.write_gallery_sections(pics, html_file)
     return len(pics)
 
 
 def iter_url_list(path: Path):
-    """Yield non-empty, non-comment ``rtsp://`` lines from a list file."""
+    """Yield non-empty, non-comment ``rtsp://`` lines from a list file.
+
+    Lines that are not RTSP URLs are dropped instead of being handed to the
+    capture pipeline, where they would waste a slot (and produce an empty
+    "camera" section) for every ``http://`` or plain-IP line in the file.
+    """
     with path.open("r", encoding="utf-8") as f:
         for raw in f:
             line = raw.strip()
             if not line or line.startswith("#"):
+                continue
+            if not line.lower().startswith("rtsp://"):
                 continue
             yield line

