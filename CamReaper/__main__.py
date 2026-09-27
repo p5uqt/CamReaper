@@ -12,7 +12,7 @@ from CamReaper import report, screenshot
 from CamReaper.cli import parser
 from CamReaper.gallery import build_from_urls, iter_url_list
 from CamReaper.scanner import Settings, run
-from CamReaper.targets import count_targets, iter_targets, iter_unique
+from CamReaper.targets import count_targets, describe as describe_targets, iter_targets, iter_unique
 
 
 def _load_lines(path: Path):
@@ -100,9 +100,9 @@ def _write_checkpoint(path: Path, checked_ips, stats) -> None:
     checked_ips.clear()
 
 
-async def _resumed_targets(path: Path, checked: set):
+async def _resumed_targets(source, checked: set):
     """Stream targets, skipping IPs already finished in a previous run."""
-    async for ip in iter_targets(path):
+    async for ip in iter_targets(source):
         if ip not in checked:
             yield ip
 
@@ -464,7 +464,7 @@ def main():
         total = n_targets
     print(
         _c(
-            f"[info] mode={args.mode} targets={args.targets.name} ips={total}/{n_targets} ports={ports} "
+            f"[info] mode={args.mode} targets={describe_targets(args.targets)} ips={total}/{n_targets} ports={ports} "
             f"routes={len(routes)} creds={len(credentials)}"
         )
     )

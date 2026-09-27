@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any
 
 from CamReaper import DEFAULT_CREDENTIALS, DEFAULT_ROUTES, __version__
+from CamReaper import targets
 
 
 class CustomHelpFormatter(argparse.HelpFormatter):
@@ -22,6 +23,28 @@ def file_path(value: Any):
     if p.is_file():
         return p
     raise argparse.ArgumentTypeError(f"{value} is not a valid path")
+
+
+def target_arg(value: str):
+    """Resolve ``-t`` into a targets *file* or an inline target spec.
+
+    Both forms are documented (and used in the README examples):
+      * a file with one target per line - ``-t targets.txt``;
+      * a literal list on the command line - ``-t 192.168.1.0/24``,
+        ``-t 10.0.0.1-10.0.0.9``, ``-t 1.1.1.1,8.8.8.8``.
+
+    A real file always wins, so a stray name that happens to look like a spec
+    cannot be mistaken for one.
+    """
+    p = Path(value)
+    if p.is_file():
+        return p
+    if targets.is_valid_spec(value):
+        return value
+    raise argparse.ArgumentTypeError(
+        f"{value!r} is neither an existing targets file nor a target spec "
+        "(e.g. 192.168.1.0/24, 10.0.0.1-10.0.0.9, 1.1.1.1)"
+    )
 
 
 def _check_port(number: int, value: Any) -> int:
@@ -100,9 +123,13 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "-t",
     "--targets",
-    type=file_path,
+    type=target_arg,
+    metavar="SPEC",
     required=False,
-    help="targets file (IPs, CIDRs and IP ranges, one per line)",
+    help=(
+        "targets file (IPs, CIDRs and IP ranges, one per line) or an inline "
+        "spec: '192.168.1.0/24', '10.0.0.1-10.0.0.9', '1.1.1.1,8.8.8.8'"
+    ),
 )
 parser.add_argument(
     "-p",

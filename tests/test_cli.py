@@ -156,3 +156,31 @@ def test_scan_mode_reports_route_and_cred_counts(monkeypatch, tmp_path, capsys):
     summary = json.loads((run / "summary.json").read_text())
     assert summary["statistics"]["errors"] == 0
     assert summary["statistics"]["checked"] == 1
+
+
+def test_targets_accepts_an_inline_cidr():
+    """`-t 192.168.1.0/24` (as used in the README) must parse instead of
+    failing with "is not a valid path"."""
+    from CamReaper.cli import target_arg
+
+    assert target_arg("192.168.1.0/24") == "192.168.1.0/24"
+    assert target_arg("10.0.0.1-10.0.0.9") == "10.0.0.1-10.0.0.9"
+    assert target_arg("1.1.1.1,8.8.8.8") == "1.1.1.1,8.8.8.8"
+
+
+def test_targets_rejects_a_typo():
+    from CamReaper.cli import target_arg
+
+    with pytest.raises(argparse.ArgumentTypeError):
+        target_arg("192.168.1.0/33")
+
+
+def test_readme_example_parses(tmp_path):
+    """The exact command from the README must be accepted end to end."""
+    monkey = tmp_path / "targets.txt"
+    monkey.write_text("127.0.0.1\n")
+    args = parser.parse_args(
+        ["-t", "192.168.1.0/24", "-p", "554", "8554", "--no-screenshots"]
+    )
+    assert args.targets == "192.168.1.0/24"
+    assert args.ports == [554, 8554]

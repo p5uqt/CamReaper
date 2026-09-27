@@ -6,9 +6,20 @@ bounded pool of active host-tasks is kept in flight.
 """
 
 import ipaddress
+import re
 from collections import OrderedDict
 from pathlib import Path
-from typing import AsyncIterator, Iterable, Iterator, List
+from typing import AsyncIterator, Iterator, List, Union
+
+# One target token of an inline ``-t`` spec: an IP, an IP/CIDR, or a range.
+# The range part allows zero whitespace so both ``1.2.3.4-5.6.7.8`` and
+# ``1.2.3.4 - 5.6.7.8`` stay a single token when the shell splits the argument.
+# ``/`` belongs to the token: "192.168.1.0/24" must not be cut into an address
+# and a stray "24".
+_SPEC_RE = re.compile(r"[0-9A-Za-z.:/%]+(?:\s*-\s*[0-9A-Za-z.:/%]+)?")
+
+# A ``-t`` argument is either a file with one target per line or an inline spec.
+TargetSource = Union[Path, str]
 
 
 def _iter_network(network) -> Iterator[str]:
@@ -86,12 +97,59 @@ def _parse_line(line: str) -> List[str]:
     return list(_iter_line(line))
 
 
-async def iter_targets(path: Path) -> AsyncIterator[str]:
-    """Yield each target IP string lazily (streaming, never fully in RAM)."""
-    with path.open("r", encoding="utf-8") as handle:
-        for raw in handle:
-            for ip in _iter_line(raw):
-                yield ip
+def inline_specs(spec: str) -> List[str]:
+    """Split an inline ``-t`` spec into target tokens.
+
+    ``"192.168.1.0/24, 10.0.0.5"`` -> ``["192.168.1.0/24", "10.0.0.5"]`` and
+    ``"10.0.0.1 - 10.0.0.9"`` -> ``["10.0.0.1 - 10.0.0.9"]`` (the range keeps
+    its spaces, so it is still one token to :func:`_iter_line`).
+    """
+    return _SPEC_RE.findall(spec)
+
+
+def is_valid_spec(spec: str) -> bool:
+    """True when ``spec`` yields at least one IP - i.e. it is a usable inline
+    target list rather than a typo that should be reported as a bad path."""
+    for token in inline_specs(spec):
+        # Consume the generator: _iter_line() returns an iterator object, which
+        # is always truthy, so "any(...)" here would accept any word at all.
+        for _ip in _iter_line(token):
+            return True
+    return False
+
+
+def is_file_source(source: TargetSource) -> bool:
+    return isinstance(source, Path)
+
+
+def describe(source: TargetSource) -> str:
+    """Short label for the "targets=..." progress line (a file keeps its name,
+    an inline spec is shown as typed, trimmed)."""
+    if isinstance(source, Path):
+        return source.name
+    text = str(source).strip()
+    return text if len(text) <= 48 else text[:45] + "..."
+
+
+def _iter_source_lines(source: TargetSource) -> Iterator[str]:
+    """Yield the raw target lines of a file source or an inline spec."""
+    if isinstance(source, Path):
+        with source.open("r", encoding="utf-8") as handle:
+            for raw in handle:
+                yield raw
+    else:
+        yield from inline_specs(str(source))
+
+
+async def iter_targets(source: TargetSource) -> AsyncIterator[str]:
+    """Yield each target IP string lazily (streaming, never fully in RAM).
+
+    ``source`` is a file with one target per line *or* an inline spec such as
+    ``192.168.1.0/24`` / ``10.0.0.1-10.0.0.9`` / ``1.1.1.1, 8.8.8.8``.
+    """
+    for raw in _iter_source_lines(source):
+        for ip in _iter_line(raw):
+            yield ip
 
 
 async def iter_unique(
@@ -118,23 +176,22 @@ async def iter_unique(
         yield ip
 
 
-def parse_all(path: Path) -> List[str]:
+def parse_all(source: TargetSource) -> List[str]:
     """Non-async helper used by tests / introspection (builds a full list)."""
     seen = set()
     out = []
-    for ip in _iter_file(path):
+    for ip in _iter_source(source):
         if ip not in seen:
             seen.add(ip)
             out.append(ip)
     return out
 
 
-def count_targets(path: Path) -> int:
+def count_targets(source: TargetSource) -> int:
     """Count the IPs the scanner will actually process (no dedup, streaming)."""
-    return sum(1 for _ in _iter_file(path))
+    return sum(1 for _ in _iter_source(source))
 
 
-def _iter_file(path: Path) -> Iterable[str]:
-    with path.open("r", encoding="utf-8") as handle:
-        for raw in handle:
-            yield from _iter_line(raw)
+def _iter_source(source: TargetSource) -> Iterator[str]:
+    for raw in _iter_source_lines(source):
+        yield from _iter_line(raw)

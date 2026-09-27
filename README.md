@@ -63,7 +63,7 @@ CamReaper [OPTIONS]
 
 | Flag | Description |
 |------|-------------|
-| `-t, --targets FILE` | Targets file - IPs, CIDRs, or IP ranges (one per line) |
+| `-t, --targets SPEC` | Targets: a file with one entry per line, or an inline spec (CIDR, range, or comma/space separated IPs) |
 
 ### Scan Options
 
@@ -127,6 +127,13 @@ CamReaper -t targets.txt -r custom_routes.txt -c custom_creds.txt
 
 ```bash
 CamReaper -t large_network.txt --no-screenshots -p 554 --dedup
+```
+
+### Several targets without a file
+
+```bash
+CamReaper -t 192.168.1.0/24,10.0.0.0/24 --no-screenshots
+CamReaper -t 10.0.0.1,10.0.0.2,10.0.0.3 -p 554 8554
 ```
 
 ### Resumable long scan
@@ -199,9 +206,20 @@ kept current through 2024-2026 disclosures. Supply your own via `--cve-db PATH`.
 
 ## Input Formats
 
-### Targets file
+### Targets
 
-One entry per line. Supported formats:
+`-t` takes either a file with one entry per line or the targets straight on the command
+line. Both accept IPs, CIDRs and IP ranges:
+
+```bash
+CamReaper -t 192.168.1.0/24 -p 554 8554          # inline CIDR
+CamReaper -t 10.0.0.1-10.0.0.50                   # inline range
+CamReaper -t 1.1.1.1,8.8.8.8                      # several addresses
+CamReaper -t "1.1.1.1 10.0.0.1 - 10.0.0.9"       # quote the whole list if it has spaces
+CamReaper -t targets.txt                          # from a file
+```
+
+Supported entry formats (in a file line, or as an inline token):
 
 ```
 192.168.1.100
@@ -210,7 +228,9 @@ One entry per line. Supported formats:
 10.0.0.1 - 10.0.0.254
 ```
 
-Blank lines and lines starting with `#` are ignored in every input file.
+Blank lines and lines starting with `#` are ignored in every input file. If the value
+is neither an existing file nor a valid target spec, the run stops with an error instead
+of silently scanning nothing.
 
 ### Routes file
 

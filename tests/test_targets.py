@@ -147,3 +147,75 @@ async def test_iter_unique_drops_duplicates():
 
     out = [ip async for ip in iter_unique(gen())]
     assert out == ["1.1.1.1", "2.2.2.2", "3.3.3.3"]
+
+
+def test_inline_specs_split_on_commas_and_spaces():
+    from CamReaper.targets import inline_specs
+
+    assert inline_specs("192.168.1.0/24") == ["192.168.1.0/24"]
+    assert inline_specs("1.1.1.1,8.8.8.8") == ["1.1.1.1", "8.8.8.8"]
+    assert inline_specs("10.0.0.0/29 10.1.0.0/30") == ["10.0.0.0/29", "10.1.0.0/30"]
+    # A range keeps its spaces as one token, with or without them.
+    assert inline_specs("10.0.0.1 - 10.0.0.9") == ["10.0.0.1 - 10.0.0.9"]
+    assert inline_specs("10.0.0.1-10.0.0.9") == ["10.0.0.1-10.0.0.9"]
+    # The "/24" must stay glued to the address, not be split off as "24".
+    assert inline_specs("192.168.1.0/24") == ["192.168.1.0/24"]
+
+
+def test_inline_specs_expand_like_file_lines():
+    from CamReaper.targets import count_targets, parse_all
+
+    assert count_targets("192.168.1.0/24") == 256
+    assert count_targets("192.168.1.5/24") == 256
+    assert count_targets("10.0.0.1-10.0.0.6") == 6
+    assert count_targets("1.1.1.1,8.8.8.8") == 2
+    assert count_targets("10.0.0.0/29 10.1.0.0/30") == 8 + 4
+    assert parse_all("192.168.9.0/30") == [
+        "192.168.9.0", "192.168.9.1", "192.168.9.2", "192.168.9.3"
+    ]
+
+
+@pytest.mark.parametrize(
+    "spec", ["192.168.1.0/33", "notafile", "999.1.1.1", "10.0.0.0/-1", ""]
+)
+def test_invalid_specs_rejected(spec):
+    """A typo must not be accepted as an "inline" target list - otherwise a
+    mistyped /33 silently scans nothing at all."""
+    from CamReaper.targets import is_valid_spec
+
+    assert is_valid_spec(spec) is False
+
+
+def test_file_still_wins_over_a_spec_named_like_one(tmp_path):
+    """If a real file matches, it is the source - the inline form is only a
+    fallback for names that are not files."""
+    from CamReaper import cli
+    from CamReaper.targets import count_targets, describe, is_file_source
+
+    target_file = tmp_path / "1.1.1.1"
+    target_file.write_text("10.20.30.40\n")
+    resolved = cli.target_arg(str(target_file))
+    assert resolved == target_file
+    assert is_file_source(resolved)
+    assert count_targets(resolved) == 1
+    assert describe(resolved) == "1.1.1.1"
+
+
+def test_describe_truncates_a_long_inline_spec():
+    from CamReaper.targets import describe
+
+    assert describe("192.168.1.0/24") == "192.168.1.0/24"
+    long_spec = " ".join(f"10.0.0.{i}" for i in range(30))
+    label = describe(long_spec)
+    assert len(label) <= 48
+    assert label.endswith("...")
+
+
+@pytest.mark.asyncio
+async def test_iter_targets_streams_inline_spec():
+    from CamReaper.targets import iter_targets
+
+    got = [ip async for ip in iter_targets("192.168.1.0/30, 10.9.9.9")]
+    assert got == [
+        "192.168.1.0", "192.168.1.1", "192.168.1.2", "192.168.1.3", "10.9.9.9"
+    ]
