@@ -40,7 +40,15 @@ def filename_for(rtsp_url: str) -> str:
 
 
 def _capture(rtsp_url: str, out_dir: str, timeout: float, out_q) -> None:
-    """Runs inside a child process; never returns a non-str."""
+    """Runs inside a child process; never returns a non-str.
+
+    Whether a frame comes out is decided by *decoding*, never by inspecting
+    stream metadata up front.  Cameras stream raw Annex B H.264/H.265 with no
+    timestamps in the SDP, so ``start_time`` is ``None`` for them while the
+    frames decode perfectly fine; a pre-check on ``profile``/``start_time``/
+    ``format`` used to throw those cameras away before a single frame was read,
+    and they were silently counted as found-with-no-screenshot.
+    """
     try:
         import av  # lazy so the tool works without av for brute-only mode
 
@@ -49,14 +57,10 @@ def _capture(rtsp_url: str, out_dir: str, timeout: float, out_q) -> None:
             timeout=timeout,
             options={"rtsp_transport": "tcp", "stimeout": str(int(timeout * 1_000_000))},
         ) as container:
-            stream = container.streams.video[0]
-            if (
-                stream.profile is None
-                or stream.start_time is None
-                or stream.codec_context.format is None
-            ):
+            if not container.streams.video:
                 out_q.put("")
                 return
+            stream = container.streams.video[0]
             stream.thread_type = "AUTO"
             for frame in container.decode(video=0):
                 path = Path(out_dir) / f"{filename_for(rtsp_url)}.jpg"

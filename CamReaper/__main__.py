@@ -706,6 +706,19 @@ def main():
             "32",
         )
     )
+    no_frame = final.get("found_no_frame", 0)
+    if no_frame:
+        # found > screenshots is not a bug to hide: every one of these is a
+        # camera whose RTSP stream opened fine but produced no decodable frame
+        # (unusual codec, or it needed longer than --screenshot-timeout).  The
+        # URLs are all in result.txt, so the number alone is enough to act on.
+        print(
+            _c(
+                f"[warn] {no_frame} found camera(s) gave no frame "
+                f"(try a larger --screenshot-timeout; URLs are in result.txt)",
+                "33",
+            )
+        )
     if final["errors"]:
         # Host pipelines that raised are counted, not fatal: surface the number
         # instead of pretending the run was clean - every one of them is a host

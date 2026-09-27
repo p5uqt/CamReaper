@@ -93,7 +93,14 @@ CamReaper [OPTIONS]
 | `--screenshot-timeout S` | `10.0` | Timeout per screenshot frame |
 | `--no-screenshots` | off | Skip screenshots entirely |
 | `--scan-channels` | off | Re-capture all channels post-scan |
-| `--scan-routes FILE` | same as `-r` | Route list for channel probing |
+| `--scan-routes FILE` | same as `-r` | Route list for channel probes |
+
+`found` and `screenshots` are counted separately on purpose: `found` is every
+stream whose RTSP authentication succeeded, while `screenshots` is only the ones
+that actually produced a decodable frame. When a camera opens but yields no
+frame the run ends with a warning and a count, and its URL is still in
+`result.txt`. Raise `--screenshot-timeout` if that number is not zero.
+
 
 ### Output Options
 
