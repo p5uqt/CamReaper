@@ -1,4 +1,5 @@
 import argparse
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -6,16 +7,107 @@ from CamReaper import DEFAULT_CREDENTIALS, DEFAULT_ROUTES, __version__
 from CamReaper import targets
 
 
-class CustomHelpFormatter(argparse.HelpFormatter):
+def positive_int(value: Any):
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"{value} must be >= 1")
+    return n
+
+
+# --- help rendering ----------------------------------------------------------
+
+
+def _terminal_width(default: int = 100) -> int:
+    """Usable help width, clamped so the option column stays readable.
+
+    argparse hardcodes a 80-column default that wraps the help text into a
+    narrow ribbon, while an unbounded width produces very long lines on a wide
+    terminal.  The column holding the flag names is what actually needs a bound.
+    """
+    try:
+        columns = shutil.get_terminal_size(fallback=(default, 24)).columns
+    except (OSError, ValueError):
+        return default
+    return max(70, min(columns - 2, default))
+
+
+class CustomHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Wider option column, and an epilog that keeps its own line breaks.
+
+    ``RawDescriptionHelpFormatter`` only preserves line breaks in the
+    description/epilog; everything else is still wrapped, which is what we want
+    for the long per-option explanations.
+    """
+
     def __init__(self, prog):
-        super().__init__(prog, max_help_position=40, width=99)
+        super().__init__(
+            prog, max_help_position=32, width=_terminal_width()
+        )
 
     def _format_action_invocation(self, action):
+        # Same as the base class, except that the option strings are joined with
+        # ", " on one line instead of argparse's default (which puts each
+        # spelling on its own line and makes "-t, --targets SPEC" three rows).
         if not action.option_strings or action.nargs == 0:
             return super()._format_action_invocation(action)
         default = self._get_default_metavar_for_optional(action)
         args_string = self._format_args(action, default)
         return ", ".join(action.option_strings) + " " + args_string
+
+
+def _render_default(value: Any) -> str:
+    """Render a default value for the help text."""
+    if isinstance(value, Path):
+        # A full package path is noise; the file name is what the user needs.
+        return value.name
+    if isinstance(value, (list, tuple)):
+        return " ".join(str(v) for v in value)
+    return str(value)
+
+
+def _with_default(kwargs: dict) -> dict:
+    """Append the option's default to its help text, in place.
+
+    Nearly every flag in this CLI has a meaningful default, and the help output
+    used to state some of them inline and silently omit others - so ``--help``
+    could not be trusted to say what a run would actually do.  Rendering it from
+    the same object argparse uses removes that whole class of drift.
+    """
+    help_text = kwargs.get("help")
+    default = kwargs.get("default")
+    if help_text is None or default in (None, argparse.SUPPRESS):
+        return kwargs
+    # store_true/store_false flags: "default: False" is pure noise.
+    if isinstance(default, bool):
+        return kwargs
+    kwargs["help"] = (
+        f"{help_text.rstrip()} (default: {_render_default(default)})"
+    )
+    return kwargs
+
+
+class _HelpGroup(argparse._ArgumentGroup):
+    """An argument group that renders defaults like :class:`HelpParser`.
+
+    ``add_argument_group`` builds a plain ``_ArgumentGroup``, which has its own
+    ``add_argument`` and would otherwise bypass the parser's rendering entirely -
+    i.e. every grouped option would silently lose its default.
+    """
+
+    def add_argument(self, *args, **kwargs):
+        return super().add_argument(*args, **_with_default(kwargs))
+
+
+class HelpParser(argparse.ArgumentParser):
+    """``ArgumentParser`` that appends each option's default to its help text."""
+
+    def add_argument(self, *args, **kwargs):
+        return super().add_argument(*args, **_with_default(kwargs))
+
+    def add_argument_group(self, *args, **kwargs):
+        group = _HelpGroup(self, *args, **kwargs)
+        self._action_groups.append(group)
+        return group
 
 
 def file_path(value: Any):
@@ -115,50 +207,169 @@ def positive_int(value: Any):
     return n
 
 
-parser = argparse.ArgumentParser(
+_DESCRIPTION = """\
+Brute-force camera credentials, run known exploits, ask ONVIF devices for
+their stream URL, and build a screenshot gallery. Options are grouped below;
+every option states its own default."""
+
+_EPILOG = """\
+examples:
+  # scan a /24 on the usual camera ports
+  CamReaper -t 192.168.1.0/24 -p 554 8554 8000
+
+  # exploit-first, then fall back to brute-force for whatever is left
+  CamReaper -t targets.txt --mode combined
+
+  # brute mode, but ask each host for its stream URL over ONVIF
+  CamReaper -t targets.txt --onvif
+
+  # slow and gentle, to stay under a camera's failed-login lockout
+  CamReaper -t targets.txt --attempts-per-sec 5 --max-attempts 10
+
+  # build a gallery from a previous run's result.txt, no scanning
+  CamReaper --capture reports/latest/result.txt
+
+  # resume an interrupted scan
+  CamReaper -t targets.txt --resume
+"""
+
+
+parser = HelpParser(
     prog="CamReaper",
-    description="Asynchronous RTSP stream scanner with screenshots and gallery.",
-    formatter_class=lambda prog: CustomHelpFormatter(prog),
+    description=_DESCRIPTION,
+    epilog=_EPILOG,
+    formatter_class=CustomHelpFormatter,
 )
-parser.add_argument(
+
+# -- targets and wordlists ----------------------------------------------------
+target_group = parser.add_argument_group("targets and wordlists")
+target_group.add_argument(
     "-t",
     "--targets",
     type=target_arg,
     metavar="SPEC",
-    required=False,
     help=(
-        "targets file (IPs, CIDRs and IP ranges, one per line) or an inline "
-        "spec: '192.168.1.0/24', '10.0.0.1-10.0.0.9', '1.1.1.1,8.8.8.8'"
+        "targets file (one IP, CIDR or range per line) or an inline spec: "
+        "'192.168.1.0/24', '10.0.0.1-10.0.0.9', '1.1.1.1,8.8.8.8'"
     ),
 )
-parser.add_argument(
+target_group.add_argument(
     "-p",
     "--ports",
     nargs="+",
     default=[554],
     action=PortList,
+    metavar="PORTS",
     help=(
-        "RTSP ports to scan, ranges allowed (default: 554), e.g. "
-        "'554 8554' or '8000-8008'. Recommended: "
-        "554 8554 5554 10554 8000 6800. Many cameras/DVRs also listen on "
-        "8554/5554/10554/8000 in addition to 554."
+        "RTSP ports, ranges allowed ('554 8554' or '8000-8008'). Cameras and "
+        "DVRs commonly listen on 554 plus 8554/5554/10554/8000/6800"
     ),
 )
-parser.add_argument(
+target_group.add_argument(
     "-r",
     "--routes",
     type=file_path,
     default=DEFAULT_ROUTES,
-    help="path to custom route list",
+    metavar="FILE",
+    help="route list to probe (one path per line)",
 )
-parser.add_argument(
+target_group.add_argument(
     "-c",
     "--credentials",
     type=file_path,
     default=DEFAULT_CREDENTIALS,
-    help="path to custom credential list (user:pass per line)",
+    metavar="FILE",
+    help="credential list to try ('user:pass' per line)",
 )
-parser.add_argument(
+
+# -- exploits: CVE and ONVIF --------------------------------------------------
+exploit_group = parser.add_argument_group("exploits: CVE and ONVIF")
+exploit_group.add_argument(
+    "--mode",
+    choices=["brute", "cve", "combined"],
+    default="brute",
+    help=(
+        "'brute' = credentials only, 'cve' = exploits only, 'combined' = "
+        "exploits first, then brute-force for hosts still unfound"
+    ),
+)
+exploit_group.add_argument(
+    "--cve-db",
+    type=file_path,
+    default=None,
+    metavar="FILE",
+    help="custom CVE database (JSON); omit to use the built-in cve_db.json",
+)
+exploit_group.add_argument(
+    "--http-ports",
+    nargs="+",
+    default=[80, 443, 8080],
+    action=PortList,
+    metavar="PORTS",
+    help=(
+        "web ports for CVE probes, ranges allowed. Only used in 'cve' or "
+        "'combined' mode, and only for hosts whose RTSP ports are all closed"
+    ),
+)
+exploit_group.add_argument(
+    "--http-timeout",
+    default=5.0,
+    type=float,
+    metavar="S",
+    help="socket timeout for CVE HTTP probes; lower it for hosts that swallow packets",
+)
+exploit_group.add_argument(
+    "--no-http",
+    action="store_true",
+    help="disable the HTTP CVE-probe fallback",
+)
+exploit_group.add_argument(
+    "--onvif",
+    action="store_true",
+    help=(
+        "ask each host for its stream URL over ONVIF (SOAP GetProfiles / "
+        "GetStreamUri) instead of guessing RTSP routes. Implied by 'cve' and "
+        "'combined'; use it to enable ONVIF in 'brute' mode"
+    ),
+)
+exploit_group.add_argument(
+    "--no-onvif",
+    action="store_true",
+    help="disable ONVIF discovery even in 'cve'/'combined' mode",
+)
+exploit_group.add_argument(
+    "--onvif-ports",
+    nargs="+",
+    default=None,
+    action=PortList,
+    metavar="PORTS",
+    help=(
+        "web ports probed for the ONVIF device service, ranges allowed. "
+        "ONVIF listens on vendor-specific ports far more often than the "
+        "vulnerable web panel does; omit for the built-in list"
+    ),
+)
+exploit_group.add_argument(
+    "--onvif-timeout",
+    default=5.0,
+    type=float,
+    metavar="S",
+    help="socket timeout for ONVIF SOAP requests",
+)
+exploit_group.add_argument(
+    "--onvif-profiles",
+    default=4,
+    type=int,
+    metavar="N",
+    help=(
+        "ONVIF profiles per device to resolve into RTSP URLs. Each one costs a "
+        "GetStreamUri call, and a 64-channel NVR answers with dozens of tokens"
+    ),
+)
+
+# -- pacing and robustness ----------------------------------------------------
+perf_group = parser.add_argument_group("pacing and robustness")
+perf_group.add_argument(
     "-ct",
     "--check-concurrency",
     default=300,
@@ -166,7 +377,84 @@ parser.add_argument(
     metavar="N",
     help="max concurrent host pipelines (network connections)",
 )
-parser.add_argument(
+perf_group.add_argument(
+    "-T",
+    "--timeout",
+    default=2.0,
+    type=float,
+    metavar="S",
+    help="socket timeout per network operation",
+)
+perf_group.add_argument(
+    "--route-parallel",
+    default=8,
+    type=int,
+    metavar="N",
+    help=(
+        "routes probed in parallel per host when hunting an open route "
+        "(0 = serial). No credentials are sent, so it cannot trip lockouts"
+    ),
+)
+perf_group.add_argument(
+    "--max-attempts",
+    default=0,
+    type=int,
+    metavar="N",
+    help=(
+        "credential attempts per host before giving up (0 = unlimited). Use "
+        "this to avoid triggering the camera's failed-login lockout"
+    ),
+)
+perf_group.add_argument(
+    "--max-transport-fails",
+    default=2,
+    type=positive_int,
+    metavar="N",
+    help=(
+        "consecutive transport failures (timeouts, dropped sockets) before "
+        "abandoning a host. Raise it for large credential lists, where cameras "
+        "may temporarily refuse connections"
+    ),
+)
+perf_group.add_argument(
+    "--attempts-per-sec",
+    default=0.0,
+    type=float,
+    metavar="N",
+    help=(
+        "cap credential attempts per host per second (0 = no limit). Slows "
+        "brute-force against one host to dodge lockouts"
+    ),
+)
+perf_group.add_argument(
+    "--host-timeout",
+    default=0.0,
+    type=float,
+    metavar="S",
+    help=(
+        "wall-clock budget for one host's whole pipeline (0 = unlimited). "
+        "Stops flaky cameras from occupying a slot for minutes"
+    ),
+)
+perf_group.add_argument(
+    "--dedup",
+    action="store_true",
+    help=(
+        "skip IPs already seen earlier in the scan (bounded LRU cache); "
+        "overlapping CIDRs and ranges would otherwise be scanned twice"
+    ),
+)
+perf_group.add_argument(
+    "--dedup-size",
+    default=1_000_000,
+    type=positive_int,
+    metavar="N",
+    help="LRU cache size for --dedup",
+)
+
+# -- screenshots and gallery --------------------------------------------------
+gallery_group = parser.add_argument_group("screenshots and gallery")
+gallery_group.add_argument(
     "-st",
     "--screenshot-concurrency",
     default=20,
@@ -174,129 +462,60 @@ parser.add_argument(
     metavar="N",
     help="max concurrent screenshot workers (decoding subprocesses)",
 )
-parser.add_argument(
+gallery_group.add_argument(
     "--screenshot-timeout",
     default=10.0,
     type=float,
     metavar="S",
-    help="seconds to wait for one screenshot frame (default: 10.0)",
+    help="seconds to wait for one screenshot frame",
 )
-parser.add_argument(
-    "-T", "--timeout", default=2.0, type=float, help="socket timeout in seconds"
-)
-parser.add_argument(
-    "--max-attempts",
-    default=0,
-    type=int,
-    metavar="N",
-    help=(
-        "max credential attempts per host before giving up (0 = unlimited). "
-        "Use this to avoid triggering the camera's failed-login lockout."
-    ),
-)
-parser.add_argument(
-    "--max-transport-fails",
-    default=2,
-    type=positive_int,
-    metavar="N",
-    help=(
-        "max consecutive transport failures (timeouts, dropped sockets) "
-        "before abandoning a host (default: 2). Increase for large credential "
-        "lists where cameras may temporarily refuse connections."
-    ),
-)
-parser.add_argument(
-    "--attempts-per-sec",
-    default=0.0,
-    type=float,
-    metavar="N",
-    help=(
-        "cap credential attempts per host per second (0 = no rate limit). "
-        "Slows down brute force against a single host to dodge lockouts."
-    ),
-)
-parser.add_argument(
-    "--host-timeout",
-    default=0.0,
-    type=float,
-    metavar="S",
-    help=(
-        "wall-clock budget (seconds) for one host's whole pipeline, "
-        "0 = unlimited.  Stops flaky cameras from occupying a slot for minutes."
-    ),
-)
-parser.add_argument(
-    "--route-parallel",
-    default=8,
-    type=int,
-    metavar="N",
-    help=(
-        "routes probed in parallel per host when hunting an open route "
-        "(default: 8; 0 = serial). No creds are sent, so it can't trip "
-        "login lockouts."
-    ),
-)
-parser.add_argument(
-    "--dedup",
-    action="store_true",
-    help=(
-        "skip IPs already seen earlier in the scan (bounded LRU cache). "
-        "Overlapping CIDRs and ranges would otherwise be scanned twice."
-    ),
-)
-parser.add_argument(
-    "--dedup-size",
-    default=1_000_000,
-    type=positive_int,
-    metavar="N",
-    help="LRU cache size for --dedup (default: 1000000)",
-)
-parser.add_argument(
+gallery_group.add_argument(
     "--no-screenshots",
     action="store_true",
     help="skip screenshot capture (pure brute-force, fastest)",
 )
-parser.add_argument(
+gallery_group.add_argument(
     "--scan-channels",
     action="store_true",
     help=(
         "after the scan, re-capture every channel of every confirmed stream "
-        "(Hikvision 101..1601, Dahua h264/chN.., ONVIF ?channel=&subtype=) into "
-        "the gallery index.html. Slower, but surfaces all camera channels."
+        "(Hikvision 101..1601, Dahua h264/chN.., ONVIF ?channel=&subtype=) "
+        "into the gallery. Slower, but surfaces all camera channels"
     ),
 )
-parser.add_argument(
+gallery_group.add_argument(
     "--scan-routes",
     type=file_path,
     default=DEFAULT_ROUTES,
+    metavar="FILE",
     help=(
-        "route list used ONLY by --scan-channels to probe every confirmed "
-        "camera for all its open streams/channels (default: same as --routes). "
-        "Does not affect the main scan."
+        "route list used ONLY by --scan-channels to probe each confirmed camera "
+        "for all of its open streams. Does not affect the main scan"
     ),
 )
-parser.add_argument(
+gallery_group.add_argument(
     "--gallery-html",
     type=file_path,
     metavar="FILE",
     help=(
         "build a gallery index.html (click-to-copy, double-click fullscreen) "
-        "from a file of rtsp:// URLs, without scanning. Channels are expanded "
-        "as in --scan-channels. Skips the scan."
+        "from a file of rtsp:// URLs, without scanning"
     ),
 )
-parser.add_argument(
+gallery_group.add_argument(
     "--capture",
     type=file_path,
     metavar="RESULTS.TXT",
     help=(
-        "build a gallery site from a file of rtsp:// links (e.g. a result.txt "
-        "of a previous run) WITHOUT brute-forcing: takes exactly ONE screenshot "
-        "per link, writes images/ and index.html next to the file, with a "
-        "progress bar. No scanning."
+        "build a gallery from a previous run's result.txt WITHOUT scanning: one "
+        "screenshot per link, writes images/ and index.html next to the file, "
+        "with a progress bar"
     ),
 )
-parser.add_argument(
+
+# -- extra output files -------------------------------------------------------
+output_group = parser.add_argument_group("extra output files")
+output_group.add_argument(
     "--failed-file",
     nargs="?",
     type=str,
@@ -304,152 +523,58 @@ parser.add_argument(
     metavar="PATH",
     help=(
         "also write hosts whose port opened but whose RTSP could not be "
-        "confirmed, one 'ip port' per line. PATH is optional: with no value "
-        "the file lands in the report folder as 'failed.txt' next to "
-        "result.txt. Only reachable-but-unconfirmed hosts are logged (never "
-        "the millions of closed TCP ports), so it does not slow the scan. "
-        "Off by default."
+        "confirmed, one 'ip port' per line. PATH is optional: with no value the "
+        "file lands in the report folder as failed.txt. Only "
+        "reachable-but-unconfirmed hosts are logged, so it does not slow the scan"
     ),
 )
-parser.add_argument(
+output_group.add_argument(
     "--failed-with-error",
     action="store_true",
     help=(
         "with --failed-file, append a short error reason so lines read "
-        "'ip port error'. The reason is already computed by the scan, so "
-        "it adds no meaningful work."
+        "'ip port error'. The reason is already computed by the scan"
     ),
 )
-parser.add_argument(
+output_group.add_argument(
     "--no-auth-file",
     nargs="?",
     type=str,
     const="__auto__",
     metavar="PATH",
     help=(
-        "also write hosts with a live RTSP port (it answered 401/403 and "
-        "requires a password) for which NO credential in the list worked, one "
-        "'ip port' per line. PATH is optional: with no value the file lands in "
-        "the report folder as 'noauth.txt' next to result.txt. These are "
-        "reachable cameras we could not open, so there are relatively few of "
-        "them and it does not slow the scan. Off by default."
+        "also write reachable cameras that required a password but accepted no "
+        "credential in the list, one 'ip port' per line. PATH is optional: with "
+        "no value the file lands in the report folder as noauth.txt"
     ),
 )
-parser.add_argument(
+
+# -- checkpoint / resume ------------------------------------------------------
+resume_group = parser.add_argument_group("checkpoint and resume")
+resume_group.add_argument(
     "--checkpoint",
     nargs="?",
     type=str,
     const="__auto__",
     metavar="PATH",
     help=(
-        "save scan progress to PATH for later resumption. "
-        "With no value the file lands in the report folder as 'checkpoint.json' "
-        "(finished IPs are appended to PATH+'.ips')."
+        "save scan progress for later resumption. With no value the file lands "
+        "in the report folder as checkpoint.json (finished IPs are appended to "
+        "PATH+'.ips')"
     ),
 )
-parser.add_argument(
+resume_group.add_argument(
     "--resume",
     nargs="?",
     type=str,
     const="__auto__",
     metavar="PATH",
     help=(
-        "resume from a previous checkpoint file, skipping already-checked IPs. "
-        "PATH is optional: with no value the newest reports/*/checkpoint.json "
-        "is used."
+        "resume from a previous checkpoint, skipping already-checked IPs. PATH "
+        "is optional: with no value the newest reports/*/checkpoint.json is used"
     ),
 )
-parser.add_argument(
-    "--mode",
-    choices=["brute", "cve", "combined"],
-    default="brute",
-    help=(
-        "scan mode: 'brute' = credential brute-force only (default), "
-        "'cve' = CVE exploits only, 'combined' = CVE first then brute-force "
-        "for unfound hosts."
-    ),
-)
-parser.add_argument(
-    "--cve-db",
-    type=file_path,
-    default=None,
-    metavar="PATH",
-    help=(
-        "path to custom CVE database JSON file "
-        "(default: built-in cve_db.json inside the package)."
-    ),
-)
-parser.add_argument(
-    "--http-ports",
-    nargs="+",
-    default=[80, 443, 8080],
-    action=PortList,
-    help=(
-        "HTTP/HTTPS ports probed for CVE exploits when no RTSP port answers, "
-        "ranges allowed (default: 80 443 8080). Only checked in 'cve' or "
-        "'combined' mode, and only for hosts whose RTSP ports are all closed."
-    ),
-)
-parser.add_argument(
-    "--http-timeout",
-    default=5.0,
-    type=float,
-    metavar="S",
-    help=(
-        "socket timeout in seconds for CVE HTTP probes (default: 5.0). "
-        "Lower it to speed up scans against hosts that swallow packets."
-    ),
-)
-parser.add_argument(
-    "--no-http",
-    action="store_true",
-    help="disable the HTTP CVE-probe fallback for hosts with no live RTSP port",
-)
-parser.add_argument(
-    "--onvif",
-    action="store_true",
-    help=(
-        "ask each host for its stream URL over ONVIF (SOAP GetProfiles / "
-        "GetStreamUri) instead of guessing RTSP routes. Implied by the 'cve' "
-        "and 'combined' modes; use with 'brute' to enable it there too."
-    ),
-)
-parser.add_argument(
-    "--no-onvif",
-    action="store_true",
-    help="disable ONVIF discovery even in 'cve'/'combined' mode",
-)
-parser.add_argument(
-    "--onvif-ports",
-    nargs="+",
-    default=None,
-    action=PortList,
-    metavar="PORT",
-    help=(
-        "web ports probed for the ONVIF device service, ranges allowed "
-        "(default: 80 8000 8080 8899 2020 34567 5000 81 8081 9000 8082). "
-        "ONVIF listens on vendor-specific ports far more often than the "
-        "vulnerable web panel does."
-    ),
-)
-parser.add_argument(
-    "--onvif-timeout",
-    default=5.0,
-    type=float,
-    metavar="S",
-    help="socket timeout in seconds for ONVIF SOAP requests (default: 5.0)",
-)
-parser.add_argument(
-    "--onvif-profiles",
-    default=4,
-    type=int,
-    metavar="N",
-    help=(
-        "how many ONVIF profiles per device to resolve into RTSP URLs "
-        "(default: 4). Each one costs a GetStreamUri call, and a 64-channel "
-        "NVR answers with dozens of tokens."
-    ),
-)
+
 parser.add_argument(
     "-v", "--version", action="version", version=f"%(prog)s {__version__}"
 )

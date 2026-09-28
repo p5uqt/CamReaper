@@ -184,3 +184,110 @@ def test_readme_example_parses(tmp_path):
     )
     assert args.targets == "192.168.1.0/24"
     assert args.ports == [554, 8554]
+
+
+# --- help output -------------------------------------------------------------
+
+
+def _help_text() -> str:
+    return parser.format_help()
+
+
+def _help_flat() -> str:
+    """Help text with runs of whitespace collapsed.
+
+    argparse wraps the help column, so a phrase like "(default: brute)" can be
+    split across a line boundary; searching the raw text would make these
+    assertions depend on the terminal width.
+    """
+    return " ".join(_help_text().split())
+
+
+def test_help_has_no_line_longer_than_the_formatter_width():
+    """Long unwrapped lines are what made the old help hard to scan."""
+    from CamReaper.cli import _terminal_width
+
+    width = _terminal_width()
+    too_long = [ln for ln in _help_text().splitlines() if len(ln) > width]
+    assert too_long == []
+
+
+def test_help_groups_options_by_purpose():
+    """One flat ~30-entry list was the main readability problem."""
+    text = _help_text()
+    for group in (
+        "targets and wordlists",
+        "exploits: CVE and ONVIF",
+        "pacing and robustness",
+        "screenshots and gallery",
+        "extra output files",
+        "checkpoint and resume",
+    ):
+        assert group in text, f"missing group: {group}"
+
+
+def test_help_states_the_default_of_every_valued_option():
+    """The help used to name some defaults inline and silently omit others, so
+    it could not be trusted to describe what a run would do."""
+    text = _help_flat()
+    for expected in (
+        "(default: 554)",
+        "(default: 80 443 8080)",
+        "(default: 5.0)",
+        "(default: 2.0)",
+        "(default: 300)",
+        "(default: 4)",
+        "(default: brute)",
+    ):
+        assert expected in text, f"missing default in help: {expected}"
+
+
+def test_help_omits_defaults_for_boolean_flags():
+    """"default: False" on every store_true flag is noise."""
+    text = _help_text()
+    assert "(default: False)" not in text
+    assert "(default: True)" not in text
+
+
+def test_help_renders_path_defaults_as_file_names():
+    """A full package path is noise; the file name is what the user needs."""
+    text = _help_flat()
+    assert "(default: defcreds)" in text
+    assert "(default: defroutes)" in text
+    assert "/CamReaper/defcreds" not in text
+
+
+def test_help_keeps_option_and_value_on_one_line():
+    """argparse's default invocation formatting splits "-t, --targets SPEC"
+    across three rows when both spellings exist."""
+    text = _help_flat()
+    assert "-t, --targets SPEC" in text
+    assert "-ct, --check-concurrency N" in text
+
+
+def test_help_includes_examples_with_line_breaks():
+    """The epilog is a usage cheat-sheet, so its layout must survive."""
+    lines = _help_text().splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("examples:"))
+    block = lines[start:]
+    for example in (
+        "CamReaper -t 192.168.1.0/24 -p 554 8554 8000",
+        "CamReaper -t targets.txt --mode combined",
+        "CamReaper -t targets.txt --onvif",
+        "CamReaper --capture reports/latest/result.txt",
+    ):
+        # Each example must survive as its own line, not be re-wrapped into the
+        # surrounding paragraph.
+        assert any(example in ln for ln in block), f"missing example: {example}"
+
+
+def test_terminal_width_is_clamped_to_a_readable_range():
+    from CamReaper.cli import _terminal_width
+    from unittest import mock
+
+    with mock.patch("shutil.get_terminal_size",
+                    return_value=mock.Mock(columns=40)):
+        assert _terminal_width() >= 70
+    with mock.patch("shutil.get_terminal_size",
+                    return_value=mock.Mock(columns=500)):
+        assert _terminal_width() <= 100
