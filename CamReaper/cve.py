@@ -13,11 +13,8 @@ Exploit types
 """
 
 import asyncio
-import contextlib
-import http.client
 import json
-import urllib.error
-import urllib.request
+import ssl
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -33,6 +30,16 @@ _HTTPS_PORTS = (443, 8443)
 # Cap on a probe response: a camera panel is never bigger than this, and an
 # unbounded read would let a hostile host eat the scanner's memory.
 _MAX_BODY = 256 * 1024
+# Cap on the response header block, same reasoning as the body cap.
+_MAX_HEADER = 64 * 1024
+# One shared, permissive TLS context.  Camera web panels ship self-signed (or
+# expired, or CN-mismatched) certificates, so verification would reject almost
+# every real device - and urllib's default context made :443 probing useless.
+# This client only *reads* public CVE-bait endpoints, so an unverifiable
+# certificate is not a risk here.
+_SSL_CONTEXT = ssl.create_default_context()
+_SSL_CONTEXT.check_hostname = False
+_SSL_CONTEXT.verify_mode = ssl.CERT_NONE
 # Fallback web-panel ports when a caller does not pass its own list.
 DEFAULT_HTTP_PORTS = (80, 443, 8080)
 # Route list used when no route list is supplied (matches the shipped defaults).
@@ -123,64 +130,138 @@ class CVEDatabase:
         return creds
 
 
-def _url_for(ip: str, port: int, path: str) -> str:
-    """Build the probe URL for one web-panel port."""
-    scheme = "https" if port in _HTTPS_PORTS else "http"
-    host = ip if port in (80, 443) else f"{ip}:{port}"
-    return f"{scheme}://{host}{path}"
+def _is_https(port: int) -> bool:
+    """True when ``port`` is probed over TLS."""
+    return port in _HTTPS_PORTS
 
 
-def _read_body(response) -> str:
-    """Read at most ``_MAX_BODY`` bytes from a response-like object."""
-    try:
-        return response.read(_MAX_BODY).decode("utf-8", errors="replace")
-    except Exception:
-        return ""
+def _host_header(ip: str, port: int) -> str:
+    """Host header value: the bare IP on default ports, ``ip:port`` otherwise."""
+    return ip if port in (80, 443) else f"{ip}:{port}"
 
 
-def _error_body(exc) -> str:
-    """Body of an :class:`urllib.error.HTTPError`, read *before* closing it.
-
-    ``HTTPError.close()`` closes the underlying file object, so reading after
-    the close silently yields an empty body - which is exactly the body a
-    vulnerable panel uses to answer 403/404.
-    """
-    body = _read_body(exc)
-    with contextlib.suppress(Exception):
-        exc.close()
-    return body
+def _decode(chunk: bytes) -> str:
+    return chunk.decode("utf-8", errors="replace")
 
 
 async def _http_request(
     ip: str, port: int, path: str, method: str = "GET",
     content_type: str = "", content: str = "", timeout: float = 5.0,
-) -> str:
-    """Perform an HTTP request in a thread (urllib is blocking).
+) -> tuple:
+    """Perform one HTTP request and return ``(status, server_header, body)``.
 
-    Returns the response body as a string, or empty string on failure.  The
-    body of a 4xx/5xx answer is returned too: a vulnerable panel usually says
+    Implemented directly on asyncio streams instead of ``urllib`` in a worker
+    thread.  urllib is blocking, so every probe used to occupy a thread from the
+    event loop's *default* executor - which asyncio caps at
+    ``min(32, cpu_count + 4)`` (16 on a 12-core box).  That capped the whole CVE
+    stage at 16 simultaneous requests no matter how high ``--check-concurrency``
+    was set, so a scan spent nearly all its time queued on those 16 threads.
+    A native client scales with ``--check-concurrency`` like the RTSP stage.
+
+    The body of a 4xx/5xx answer is returned too: a vulnerable panel usually says
     "403 Forbidden" *and* hands out the config file, so dropping the body of
     every non-200 answer would hide most of the CVEs this engine looks for.
+
+    Returns ``("", "", "")`` on any transport failure.
     """
-    url = _url_for(ip, port, path)
-
-    def _do() -> str:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        if content_type:
-            headers["Content-Type"] = content_type
-        req = urllib.request.Request(
-            url, data=content.encode() if content else None,
-            headers=headers, method=method,
+    writer = None
+    try:
+        ssl_ctx = _SSL_CONTEXT if _is_https(port) else None
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port, ssl=ssl_ctx), timeout=timeout
         )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return _read_body(resp)
-        except urllib.error.HTTPError as exc:
-            return _error_body(exc)
-        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
-            return ""
+        body_bytes = content.encode() if content else b""
+        head = [f"{method} {path} HTTP/1.1", f"Host: {_host_header(ip, port)}"]
+        if content_type:
+            head.append(f"Content-Type: {content_type}")
+        head.append(f"Content-Length: {len(body_bytes)}")
+        head.append("Connection: close")
+        head.append("User-Agent: Mozilla/5.0")
+        request = ("\r\n".join(head) + "\r\n\r\n").encode() + body_bytes
+        writer.write(request)
+        await asyncio.wait_for(writer.drain(), timeout=timeout)
 
-    return await asyncio.to_thread(_do)
+        # Read until the header terminator, capped so a hostile host cannot
+        # stream an unbounded header block at us.
+        raw = bytearray()
+        while b"\r\n\r\n" not in raw:
+            chunk = await asyncio.wait_for(reader.read(4096), timeout=timeout)
+            if not chunk:
+                break  # closed early: fall through, headers are what we got
+            raw += chunk
+            if len(raw) > _MAX_HEADER:
+                raw = raw[:_MAX_HEADER]
+                break
+
+        head_part, _, rest = bytes(raw).partition(b"\r\n\r\n")
+        lines = head_part.decode("utf-8", errors="replace").split("\r\n")
+        status = lines[0].split(" ")[1] if len(lines[0].split(" ")) > 1 else ""
+        server = ""
+        content_length = None
+        chunked = False
+        for line in lines[1:]:
+            name, _, value = line.partition(":")
+            key = name.strip().lower()
+            if key == "server" and not server:
+                server = value.strip()
+            elif key == "content-length":
+                try:
+                    content_length = int(value.strip())
+                except ValueError:
+                    content_length = None
+            elif key == "transfer-encoding" and "chunked" in value.lower():
+                chunked = True
+
+        body = rest
+        if chunked:
+            body = await _read_chunked(reader, timeout, len(body))
+        elif content_length is not None:
+            want = min(max(content_length, 0), _MAX_BODY) - len(body)
+            while want > 0:
+                chunk = await asyncio.wait_for(reader.read(min(want, 65536)),
+                                               timeout=timeout)
+                if not chunk:
+                    break
+                body += chunk
+                want -= len(chunk)
+        else:
+            # No length and no chunking: read until the peer closes, capped.
+            while len(body) < _MAX_BODY:
+                chunk = await asyncio.wait_for(reader.read(65536), timeout=timeout)
+                if not chunk:
+                    break
+                body += chunk
+
+        return status, server, _decode(bytes(body[:_MAX_BODY]))
+    except (asyncio.TimeoutError, OSError, ssl.SSLError, ValueError):
+        return "", "", ""
+    except Exception:
+        return "", "", ""
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+
+async def _read_chunked(reader, timeout: float, prefix: bytes = b"") -> bytes:
+    """Decode a chunked transfer body, bounded by ``_MAX_BODY``."""
+    out = bytearray(prefix)
+    try:
+        while len(out) < _MAX_BODY:
+            size_line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+            if not size_line:
+                break
+            size = int(size_line.split(b";")[0].strip() or b"0", 16)
+            if size == 0:
+                break
+            out += await asyncio.wait_for(reader.readexactly(size), timeout=timeout)
+            await asyncio.wait_for(reader.readexactly(2), timeout=timeout)  # CRLF
+    except (asyncio.TimeoutError, OSError, ValueError, asyncio.IncompleteReadError):
+        pass
+    return bytes(out)
+
 
 
 async def find_backdoor_stream(
@@ -228,7 +309,7 @@ async def try_http_probe(
     ip: str, port: int, entry: CVEEntry, timeout: float = 5.0,
 ) -> bool:
     """Try an HTTP-based CVE probe. Returns True if pattern matched."""
-    body = await _http_request(
+    _status, _server, body = await _http_request(
         ip, port, entry.url_path, entry.method,
         entry.content_type, entry.content, timeout,
     )
@@ -288,13 +369,21 @@ async def run_cve_stage(
                 await record_cve_test(ip, live.port, entry.id, False)
 
         elif entry.type == "http_probe":
-            for hport in (http_ports or DEFAULT_HTTP_PORTS):
-                if stats is not None:
-                    stats["cve_tested"] = stats.get("cve_tested", 0) + 1
+            # All (port x entry) probes go out concurrently: a dead web panel
+            # costs a full timeout *each*, and running them one after another
+            # made the CVE stage's wall-clock time the sum of every timeout.
+            ports = list(http_ports or DEFAULT_HTTP_PORTS)
+            if stats is not None:
+                stats["cve_tested"] = stats.get("cve_tested", 0) + len(ports)
+
+            async def _probe_one(hport, e=entry):
                 try:
-                    ok = await try_http_probe(ip, hport, entry, http_timeout)
+                    return hport, await try_http_probe(ip, hport, e, http_timeout)
                 except Exception:
-                    ok = False
+                    return hport, False
+
+            results = await asyncio.gather(*(_probe_one(hp) for hp in ports))
+            for hport, ok in results:
                 await record_cve_test(ip, hport, entry.id, ok)
                 if ok:
                     # The panel is vulnerable, but it gives us no RTSP
@@ -326,18 +415,7 @@ async def probe_http_host(
     from CamReaper.vendor import detect_vendor_http
 
     # Fingerprint via a lightweight root GET (Server header + a peek of body).
-    def _root() -> tuple:
-        try:
-            with urllib.request.urlopen(_url_for(ip, port, "/"), timeout=timeout) as resp:
-                server = resp.headers.get("Server", "") or ""
-                return server, _read_body(resp)
-        except urllib.error.HTTPError as exc:
-            server = exc.headers.get("Server", "") if exc.headers else ""
-            return server, _error_body(exc)
-        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
-            return "", ""
-
-    server_header, body = await asyncio.to_thread(_root)
+    _status, server_header, body = await _http_request(ip, port, "/", timeout=timeout)
     if not body and not server_header:
         return []
     if stats is not None:
@@ -354,14 +432,18 @@ async def probe_http_host(
     if not entries:
         return []
 
-    found = []
-    for entry in entries:
-        if stats is not None:
-            stats["cve_tested"] = stats.get("cve_tested", 0) + 1
+    if stats is not None:
+        stats["cve_tested"] = stats.get("cve_tested", 0) + len(entries)
+
+    async def _probe_one(entry):
         try:
-            ok = await try_http_probe(ip, port, entry, timeout)
+            return entry, await try_http_probe(ip, port, entry, timeout)
         except Exception:
-            ok = False
+            return entry, False
+
+    results = await asyncio.gather(*(_probe_one(e) for e in entries))
+    found = []
+    for entry, ok in results:
         await record_cve_test(ip, port, entry.id, ok)
         if ok:
             found.append(Found(

@@ -391,6 +391,16 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--http-timeout",
+    default=5.0,
+    type=float,
+    metavar="S",
+    help=(
+        "socket timeout in seconds for CVE HTTP probes (default: 5.0). "
+        "Lower it to speed up scans against hosts that swallow packets."
+    ),
+)
+parser.add_argument(
     "--no-http",
     action="store_true",
     help="disable the HTTP CVE-probe fallback for hosts with no live RTSP port",

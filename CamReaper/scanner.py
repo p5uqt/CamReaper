@@ -451,12 +451,19 @@ async def _handle_host(ip: str, s: Settings, stats: dict = None) -> list:
         ):
             from CamReaper.cve import probe_http_host
 
-            for hport in s.http_ports:
-                found_here = await probe_http_host(
+            # Probe the web-panel ports concurrently.  Serially, a host with no
+            # live RTSP port cost one full timeout *per HTTP port* back to back,
+            # which made --mode cve many times slower than --mode brute on the
+            # same target list - even though the ports are independent.
+            async def _probe_http(hport):
+                return await probe_http_host(
                     ip, hport, s.cve_db, s.http_timeout, stats
                 )
-                if found_here:
-                    found.extend(found_here)
+
+            for found_here in await asyncio.gather(
+                *(_probe_http(hp) for hp in s.http_ports)
+            ):
+                found.extend(found_here or ())
         return found
 
     # A pathological camera (accepts the port but stalls mid-brute) must not

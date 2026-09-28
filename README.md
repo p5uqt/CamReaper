@@ -84,6 +84,7 @@ CamReaper [OPTIONS]
 | `--cve-db PATH` | built-in | Path to a custom CVE database JSON file |
 | `--http-ports PORTS` | `80 443 8080` | HTTP/HTTPS ports probed for CVEs on hosts with no live RTSP port; ranges allowed (`8000-8008`) |
 | `--no-http` | off | Disable the HTTP CVE-probe fallback |
+| `--http-timeout S` | `5.0` | Socket timeout in seconds for CVE HTTP probes |
 
 ### Screenshot Options
 

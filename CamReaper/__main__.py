@@ -495,6 +495,7 @@ def main():
         mode=args.mode,
         cve_db=cve_db,
         http_ports=args.http_ports,
+        http_timeout=args.http_timeout,
         no_http=args.no_http,
     )
 
