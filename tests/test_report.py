@@ -50,6 +50,60 @@ async def test_record_gallery_escapes_attributes(paths):
     assert 'alt="rtsp://a"b' not in content
 
 
+async def test_record_gallery_shows_address_port_and_login(paths):
+    """Under each screenshot the gallery shows address, port and login:password."""
+    _, html = paths
+    await report.record_gallery(
+        "rtsp://admin:admin@192.168.1.64:8554/h264/ch1/main/av_stream",
+        "pics/a.jpg",
+    )
+    await report.close_report_files()
+    content = html.read_text()
+    assert 'class="cap"' in content
+    assert "192.168.1.64" in content  # address
+    assert "8554" in content  # port
+    assert "admin:admin" in content  # login with password
+
+
+async def test_record_gallery_caption_marks_missing_auth(paths):
+    """A stream with no credentials says so instead of an empty login line."""
+    _, html = paths
+    await report.record_gallery("rtsp://1.2.3.4:554/", "pics/a.jpg")
+    await report.close_report_files()
+    content = html.read_text()
+    assert "no auth" in content
+    assert "1.2.3.4" in content and "554" in content
+
+
+async def test_record_gallery_caption_escapes_credentials(paths):
+    """A password with quotes/& must not break out of the caption markup."""
+    _, html = paths
+    await report.record_gallery('rtsp://us"er:p&ss@1.2.3.4:554/s', "pics/a.jpg")
+    await report.close_report_files()
+    content = html.read_text()
+    assert "us&quot;er:p&amp;ss" in content
+    assert 'us"er' not in content
+
+
+def test_gallery_copy_dropdown_has_three_modes(paths):
+    """'Copy on click' offers: bare address, ffplay+TCP, and the full rtsp link."""
+    _, html = paths
+    report.init_html(html)
+    content = html.read_text()
+    # the dropdown itself is back
+    assert '<select id="copyMode"' in content
+    assert 'setCopyMode()' in content
+    # 1. bare address (host:port)
+    assert 'value="addr"' in content
+    assert "function streamAddress(url){" in content
+    # 2. ffplay, forced over TCP
+    assert 'value="ffplay"' in content
+    assert '"ffplay -rtsp_transport tcp "' in content
+    # 3. the full rtsp stream, with credentials and route
+    assert 'value="rtsp"' in content
+    assert "t=img.alt;" in content
+
+
 def test_writers_work_on_a_second_event_loop(tmp_path):
     """A module-level asyncio.Lock would bind to the first loop and break every
     later run; the writers must be usable from any loop."""

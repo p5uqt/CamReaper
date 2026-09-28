@@ -290,9 +290,9 @@ Each run creates a timestamped folder under `reports/<timestamp>/`:
 
 The HTML gallery (`index.html`) provides:
 
-- **Click to copy** - copies the RTSP URL to clipboard
+- **Click to copy** - copies to clipboard, in one of three modes chosen from the dropdown: bare `host:port`, the `ffplay` command over TCP, or the full `rtsp://` link
 - **Double-click fullscreen** - opens the screenshot in a lightbox
-- **Copy mode dropdown** - switch between plain URL and `ffplay` command
+- **Address under each screenshot** - address, port and login with password
 - **Camera grouping** - screenshots from the same camera are grouped under a header
 - **Vendor detection** - headers show detected vendor (Hikvision, Dahua, ONVIF, etc.)
 

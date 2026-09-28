@@ -86,11 +86,17 @@ _HTML_HEADER = """<!DOCTYPE html>
    background:#1e1e1e;border:1px solid #3a3a3a;border-left:4px solid #7CFC00;
    margin:22px 0 6px 0;padding:7px 12px;border-radius:3px}
  .cam-head small{color:#999;font-weight:normal}
+ div.cap{font-family:monospace;font-size:12px;color:#bbb;line-height:1.45;
+   word-break:break-all;padding:3px 2px 0 2px;text-align:left}
+ div.cap b{color:#7CFC00;font-weight:normal}
+ div.cap .lbl{color:#666}
+ div.cap .pw{color:#ffb86c}
+ div.cap .none{color:#666;font-style:italic}
 </style>
 </head>
 <body>
 <script>
-var copyMode="url";
+var copyMode="addr";
 var CM_KEY="CamReaperCopyMode";
 window.onload=function(){var n=document.querySelectorAll("div.responsive").length;
  document.getElementById("total").innerHTML=":: Total images: "+n+" ::";
@@ -100,11 +106,28 @@ function setCopyMode(m,persist){
  copyMode=m;
  if(persist!==false){try{localStorage.setItem(CM_KEY,copyMode);}catch(e){}}
 }
+function streamAddress(url){
+ // "host:port" of an rtsp:// URL - the bare address, no scheme/creds/route.
+ var s=String(url);
+ if(s.slice(0,7).toLowerCase()==="rtsp://"){s=s.slice(7);}
+ var authority=s.split("/")[0];
+ var at=authority.lastIndexOf("@");
+ if(at!==-1){authority=authority.slice(at+1);}
+ return authority;
+}
 function copyText(img){
  // what gets copied is chosen by the "Copy on click" dropdown:
- //  * plain address (rtsp://...)  ->  copyMode="url"
- //  * ffplay <address>            ->  copyMode="ffplay"
- var t=(copyMode==="ffplay")?("ffplay -rtsp_transport tcp "+img.alt):img.alt;
+ //  * "addr"   -> host:port only          (bare address)
+ //  * "ffplay" -> ffplay command, TCP     (play the stream)
+ //  * "rtsp"   -> the full rtsp:// stream (creds + route included)
+ var t;
+ if(copyMode==="ffplay"){
+  t="ffplay -rtsp_transport tcp "+img.alt;
+ } else if(copyMode==="rtsp"){
+  t=img.alt;
+ } else {
+  t=streamAddress(img.alt);
+ }
  navigator.clipboard.writeText(t);
  var el=document.getElementById("toast");
  el.style.display="block"; el.textContent="Copied: "+t;
@@ -127,8 +150,8 @@ function clickOrDouble(img,ev){
 }
 function toggleFull(img){
  var v=document.getElementById("viewer");
- if(v.style.display==="flex"){v.style.display="none";return;}
  var big=v.querySelector("img");
+ if(v.style.display==="flex"){v.style.display="none";return;}
  big.src=img.src; big.alt=img.alt;
  v.style.display="flex";
 }
@@ -144,8 +167,9 @@ function viewerClick(ev){
 <div class="controls">
  <label for="copyMode">Copy on click:</label>
  <select id="copyMode" onchange="setCopyMode()">
-  <option value="url">address (rtsp://...)</option>
-  <option value="ffplay">ffplay + address</option>
+  <option value="addr">address (host:port)</option>
+  <option value="ffplay">ffplay + address (TCP)</option>
+  <option value="rtsp">rtsp stream (full link)</option>
  </select>
 </div>
 <p id="total"></p>
@@ -271,9 +295,56 @@ def _gallery_entry(url: str, pic_rel: str) -> str:
         f'alt="{html.escape(str(url), quote=True)}" '
         'width="600" height="400" '
         'loading="lazy" onclick="clickOrDouble(this,event)">'
-        '<p style="font-size:11px;margin:2px">click: copy &middot; '
-        "double click: fullscreen</p></div></div>\n"
+        f"{_stream_caption(url)}</div></div>\n"
     )
+
+
+def _split_stream_url(url: str):
+    """Split an RTSP URL into ``(host, port, user, password)``.
+
+    Mirrors :func:`CamReaper.gallery._split_url` but is kept local (and HTML-safe)
+    so ``report`` stays free of a circular import.  Missing pieces come back
+    empty / at the RTSP default of 554.
+    """
+    from urllib.parse import unquote
+
+    s = str(url)
+    s = s[len("rtsp://"):] if s.lower().startswith("rtsp://") else s
+    authority = s.split("/", 1)[0]
+    userinfo = ""
+    if "@" in authority:
+        userinfo, _, authority = authority.rpartition("@")
+    host, _, port_s = authority.partition(":")
+    port = port_s if port_s.isdigit() else "554"
+    user = password = ""
+    if userinfo and ":" in userinfo:
+        raw_user, _, raw_pass = userinfo.partition(":")
+        user, password = unquote(raw_user), unquote(raw_pass)
+    return host, port, user, password
+
+
+def _stream_caption(url: str) -> str:
+    """Caption under a screenshot: address, port and login with password.
+
+    The RTSP address is split into its parts so the credentials are readable
+    without hunting through a long URL.  Every value is HTML-escaped: a password
+    may legitimately contain quotes or ``&`` and must not break the markup.
+    """
+    host, port, user, password = _split_stream_url(url)
+    esc = lambda v: html.escape(str(v), quote=True)
+    rows = [
+        f'<div><span class="lbl">addr</span> <b>{esc(host)}</b></div>',
+        f'<div><span class="lbl">port</span> <b>{esc(port)}</b></div>',
+    ]
+    if user:
+        rows.append(
+            f'<div><span class="lbl">login</span> <span class="pw">'
+            f"{esc(user)}:{esc(password)}</span></div>"
+        )
+    else:
+        rows.append('<div><span class="lbl">login</span> '
+                    '<span class="none">no auth</span></div>')
+    return f'<div class="cap">{"".join(rows)}</div>'
 
 
 def _gallery_label(url: str) -> str:
