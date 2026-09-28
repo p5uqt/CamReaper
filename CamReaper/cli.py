@@ -406,5 +406,50 @@ parser.add_argument(
     help="disable the HTTP CVE-probe fallback for hosts with no live RTSP port",
 )
 parser.add_argument(
+    "--onvif",
+    action="store_true",
+    help=(
+        "ask each host for its stream URL over ONVIF (SOAP GetProfiles / "
+        "GetStreamUri) instead of guessing RTSP routes. Implied by the 'cve' "
+        "and 'combined' modes; use with 'brute' to enable it there too."
+    ),
+)
+parser.add_argument(
+    "--no-onvif",
+    action="store_true",
+    help="disable ONVIF discovery even in 'cve'/'combined' mode",
+)
+parser.add_argument(
+    "--onvif-ports",
+    nargs="+",
+    default=None,
+    action=PortList,
+    metavar="PORT",
+    help=(
+        "web ports probed for the ONVIF device service, ranges allowed "
+        "(default: 80 8000 8080 8899 2020 34567 5000 81 8081 9000 8082). "
+        "ONVIF listens on vendor-specific ports far more often than the "
+        "vulnerable web panel does."
+    ),
+)
+parser.add_argument(
+    "--onvif-timeout",
+    default=5.0,
+    type=float,
+    metavar="S",
+    help="socket timeout in seconds for ONVIF SOAP requests (default: 5.0)",
+)
+parser.add_argument(
+    "--onvif-profiles",
+    default=4,
+    type=int,
+    metavar="N",
+    help=(
+        "how many ONVIF profiles per device to resolve into RTSP URLs "
+        "(default: 4). Each one costs a GetStreamUri call, and a 64-channel "
+        "NVR answers with dozens of tokens."
+    ),
+)
+parser.add_argument(
     "-v", "--version", action="version", version=f"%(prog)s {__version__}"
 )

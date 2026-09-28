@@ -85,6 +85,11 @@ CamReaper [OPTIONS]
 | `--http-ports PORTS` | `80 443 8080` | HTTP/HTTPS ports probed for CVEs on hosts with no live RTSP port; ranges allowed (`8000-8008`) |
 | `--no-http` | off | Disable the HTTP CVE-probe fallback |
 | `--http-timeout S` | `5.0` | Socket timeout in seconds for CVE HTTP probes |
+| `--onvif` | off in `brute` | Ask each host for its stream URL over ONVIF (SOAP `GetProfiles`/`GetStreamUri`). Implied by `cve` and `combined` |
+| `--no-onvif` | off | Disable ONVIF discovery even in `cve`/`combined` mode |
+| `--onvif-ports PORTS` | `80 8000 8080 8899 2020 34567 5000 81 8081 9000 8082` | Web ports probed for the ONVIF device service; ranges allowed |
+| `--onvif-timeout S` | `5.0` | Socket timeout in seconds for ONVIF SOAP requests |
+| `--onvif-profiles N` | `4` | How many ONVIF profiles per device to resolve into RTSP URLs |
 
 ### Screenshot Options
 
@@ -176,13 +181,28 @@ CamReaper -t targets.txt --mode combined
 CamReaper -t targets.txt --mode combined --no-http
 ```
 
+### Scan with ONVIF discovery
+
+```bash
+# ONVIF in the default brute mode
+CamReaper -t targets.txt --onvif
+
+# Only the vendor ports that actually serve ONVIF
+CamReaper -t targets.txt --onvif --onvif-ports 8000 8080 34567
+
+# Resolve more channels per device, and turn it off again
+CamReaper -t targets.txt --onvif --onvif-profiles 8
+CamReaper -t targets.txt --mode combined --no-onvif
+```
+
 ---
 
 ## CVE Scanning
 
 When `--mode` is `cve` or `combined`, CamReaper switches on known exploits for
-the camera vendor detected from the RTSP `Server` header (and, for HTTP, from
-the web panel's `Server` header / page body):
+the camera vendor detected from the RTSP `Server` header, the
+`WWW-Authenticate` realm, or (for HTTP) the web panel's `Server` header / page
+body:
 
 1. **Backdoor credentials** (`backdoor_creds`) - tries vendor-documented default
    or hardcoded credentials (e.g. Hikvision `admin:Hik@2014`) that were never
@@ -191,6 +211,15 @@ the web panel's `Server` header / page body):
 2. **HTTP probes** (`http_probe`) - issues a crafted HTTP request and matches
    the response against the CVE's success pattern to confirm the vulnerability
    is present (config disclosure, RCE endpoints, etc.).
+
+Credentials are de-duplicated across all entries: the same default password is
+listed by many CVEs, and a credential that failed once against a host fails
+every time, so it is never re-sent.
+
+A vendor with no backdoor entry of its own - including an unrecognised
+`Generic` device - additionally gets the shared factory-default list shipped as
+`GEN-CAM-DEFAULTS`, so an unidentified camera is still checked against the
+passwords these devices ship with instead of being skipped.
 
 For hosts whose RTSP ports are **all closed**, CamReaper falls back to probing
 the configured `--http-ports` (default `80 443 8080`) on the remote web panel.
@@ -209,6 +238,33 @@ Modes:
 The built-in CVE database (`CamReaper/cve_db.json`) ships with 26 entries for
 Hikvision, Dahua, Zosi, Xiongmai, PTZOptics, Sony, V380, AVTECH and others,
 kept current through 2024-2026 disclosures. Supply your own via `--cve-db PATH`.
+
+---
+
+## ONVIF Discovery
+
+Route guessing only reaches the vendors whose paths are well known. Most modern
+cameras speak ONVIF and will hand out their **exact** stream URL - correct
+channel, correct sub-stream - if you just ask. CamReaper does that over the
+device service's HTTP port (which is usually *not* the RTSP port):
+
+1. `POST` a SOAP `GetProfiles` request to the device/media service endpoint;
+2. collect every profile token (one per channel, main and sub-stream);
+3. `POST` `GetStreamUri` per token, which returns the device's own `rtsp://` URL;
+4. confirm that URL over RTSP before reporting it.
+
+Enabled by `--onvif`, and implied by `--mode cve` / `--mode combined`. Disable
+with `--no-onvif`.
+
+Authentication is attempted in order, each step cheap and many devices accepting
+more than one: no credentials at all, WS-Security `UsernameToken` with
+`PasswordDigest`, WS-Security `PasswordText`, HTTP Basic, then HTTP Digest.
+
+Cost is kept bounded in three ways: a port that is not serving ONVIF is
+rejected after a single anonymous request; the credential list is de-duplicated
+and capped; and at most `--onvif-profiles` tokens are resolved per device.
+Because the check happens only after the cheap RTSP route sweep comes up empty,
+a camera that answers `/` straight away pays nothing for it.
 
 ---
 

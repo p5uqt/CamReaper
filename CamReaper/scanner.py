@@ -92,6 +92,11 @@ class Settings:
     http_timeout: float = 5.0  # timeout for CVE HTTP probes
     http_ports: list = field(default_factory=lambda: [80, 443, 8080])
     no_http: bool = False  # disable HTTP CVE-probe fallback
+    onvif: bool = False  # discover stream URLs over ONVIF instead of guessing
+    onvif_ports: list = field(default_factory=list)  # empty = onvif.ONVIF_PORTS
+    onvif_timeout: float = 5.0
+    onvif_profiles: int = 4
+    onvif_creds: list = field(default_factory=list)  # empty = onvif defaults
 
 
 async def try_auth(client: RTSPClient, cred: str, route: str):
@@ -107,6 +112,28 @@ async def try_auth(client: RTSPClient, cred: str, route: str):
         if await client.connect(client.port):
             ok = await client.authorize(client.port, route, cred)
     return client.status_code, client.is_connected
+
+
+async def _verify_stream(
+    ip: str, port: int, route: str, cred: str, timeout: float,
+) -> bool:
+    """Confirm that a discovered (port, route, credential) really plays.
+
+    Used for streams whose origin did not come from our own probing - currently
+    only the ONVIF stage.  A device's ``GetStreamUri`` answer is not proof: a
+    profile can be configured but disabled, and a stale URL is still returned.
+    One authenticated DESCRIBE separates the two.
+    """
+    probe = RTSPClient(ip, port, timeout, cred)
+    try:
+        if not await probe.connect():
+            return False
+        code, _still = await try_auth(probe, cred, route)
+        return code == "200"
+    except Exception:
+        return False
+    finally:
+        probe.close()
 
 
 async def _reconnect(client: RTSPClient, attempts: int = 3) -> bool:
@@ -494,8 +521,45 @@ async def _handle_host(ip: str, s: Settings, stats: dict = None) -> list:
         live.close()
         return found
 
+    # ---- stage 2.5: ONVIF stream discovery ----
+    # Only reached when the cheap RTSP route sweep came up empty, so the fast
+    # path (a camera that answers "/" straight away) pays nothing for it.  ONVIF
+    # runs over HTTP on its own port and needs no guessing, so a device found
+    # here is a *stream*, not a lead.
+    if s.onvif:
+        from CamReaper.onvif import discover, parse_stream_uri
+
+        try:
+            res = await discover(
+                ip,
+                ports=s.onvif_ports or None,
+                timeout=s.onvif_timeout,
+                creds=s.onvif_creds or None,
+                max_profiles=s.onvif_profiles,
+            )
+        except Exception:
+            res = None
+        for st in (res.streams if res else []):
+            parsed = parse_stream_uri(st.uri, st.credentials)
+            if not parsed:
+                continue
+            _host, dport, droute = parsed
+            # The device said this URI is a stream; confirm it over RTSP before
+            # reporting it, so a device that hands out a stale or profile-only
+            # URL cannot pad the report with results that do not play.
+            if not await _verify_stream(ip, dport, droute, st.credentials, s.timeout):
+                continue
+            found.append(Found(ip, dport, droute, st.credentials, vendor))
+            if stats is not None:
+                stats["onvif_found"] = stats.get("onvif_found", 0) + 1
+            live.close()
+            return found
+
     # ---- stage 3: CVE exploits (vendor-specific backdoors & HTTP probes) ----
-    if s.mode in ("cve", "combined") and s.cve_db and vendor != "Generic":
+    # "Generic" is no longer excluded: the CVE database ships a shared
+    # factory-default credential list for unidentified devices, and the vendor-
+    # specific http_probe entries are harmless to try against any web panel.
+    if s.mode in ("cve", "combined") and s.cve_db:
         from CamReaper.cve import run_cve_stage
 
         cve_found = await run_cve_stage(

@@ -476,6 +476,14 @@ def main():
         args.host_timeout = 30.0
         print(_c("[info] auto host budget: 30s (override with --host-timeout)", "33"))
 
+    # ONVIF discovery is implied by the exploit-oriented modes (its whole point
+    # is to replace RTSP route guessing with the device's own answer) and can be
+    # enabled explicitly in 'brute' mode with --onvif, or turned off again with
+    # --no-onvif.
+    onvif_enabled = (
+        (args.onvif or args.mode in ("cve", "combined")) and not args.no_onvif
+    )
+
     settings = Settings(
         ports=ports,
         routes=routes,
@@ -497,6 +505,14 @@ def main():
         http_ports=args.http_ports,
         http_timeout=args.http_timeout,
         no_http=args.no_http,
+        onvif=onvif_enabled,
+        onvif_ports=list(args.onvif_ports) if args.onvif_ports else [],
+        onvif_timeout=args.onvif_timeout,
+        onvif_profiles=max(1, args.onvif_profiles),
+        # The ONVIF module's own short default list is used unless the caller
+        # supplied credentials: the scanner's full wordlist is sized for RTSP
+        # bruting, and replaying thousands of it over SOAP would be pointless.
+        onvif_creds=list(credentials) if (credentials and args.onvif) else [],
     )
 
     # Local mirror of the live stats; ``show`` copies the scanner's own dict here

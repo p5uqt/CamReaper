@@ -6,6 +6,7 @@ import pytest
 from CamReaper import report
 from CamReaper.cve import (
     CVEDatabase,
+    find_backdoor_stream,
     try_backdoor_creds,
     run_cve_stage,
     try_http_probe,
@@ -584,3 +585,179 @@ async def test_rtsp_cve_hit_still_stops_the_host(report_paths, sample_db, tmp_pa
         assert "admin:Hik@2014@127.0.0.1" in report_paths.read_text()
     finally:
         await rtsp.stop()
+
+
+# --- shipped database integrity ---------------------------------------------
+
+
+async def test_every_cve_vendor_is_detectable():
+    """A CVE entry whose vendor has no signature in vendors.json is dead code:
+    detect_vendor can never return that name, so the entry is never reached."""
+    from CamReaper.vendor import _load_vendors
+
+    vendors, _compiled = _load_vendors()
+    known = {v["vendor"] for v in vendors}
+    db = CVEDatabase()
+    unreachable = sorted({
+        e.vendor for e in db.entries if e.vendor not in known
+    })
+    assert unreachable == []
+
+
+async def test_generic_vendor_is_last_in_signature_table():
+    """Generic matches unconditionally, so evaluating it before a real
+    signature would swallow every host."""
+    from CamReaper.vendor import _load_vendors
+
+    _vendors, compiled = _load_vendors()
+    names = [row[0] for row in compiled]
+    assert names[-1] == "Generic"
+    assert names.count("Generic") == 1
+
+
+async def test_shipped_db_has_generic_backdoor_entry():
+    """An unidentified camera must still be checked against factory defaults."""
+    db = CVEDatabase()
+    generic = [
+        e for e in db.get_for_vendor("Generic") if e.type == "backdoor_creds"
+    ]
+    assert len(generic) == 1
+    assert len(generic[0].credentials) > 5
+    assert "admin:admin" in generic[0].credentials
+
+
+# --- credential de-duplication ----------------------------------------------
+
+
+async def test_find_backdoor_stream_skips_already_tried_credentials(report_paths,
+                                                                 sample_db):
+    """The same default password is listed by many CVE entries; re-sending it
+    costs RTSP round-trips and cannot change the outcome."""
+    from tests.mock_rtsp import make_server
+
+    srv = await make_server("scanner", valid_cred="nobody:nothing")
+    try:
+        db = CVEDatabase(sample_db)
+        client = RTSPClient(srv.host, srv.port, 1.0, ":")
+        await client.connect()
+        entry = db.get_for_vendor("Hikvision")[0]
+        # admin:admin is Dahua's credential, not this entry's - pre-tried.
+        assert await find_backdoor_stream(
+            client, entry, skip={"admin:admin"}
+        ) is None
+        client.close()
+    finally:
+        await srv.stop()
+
+
+async def test_run_cve_stage_never_retries_a_credential(report_paths, tmp_path):
+    """Across the whole entry list each credential must be sent at most once."""
+    from tests.mock_rtsp import make_server
+
+    db_path = tmp_path / "cve_db.json"
+    db_path.write_text(json.dumps({"cves": [
+        {"id": "A", "vendor": "Hikvision", "type": "backdoor_creds",
+         "description": "", "severity": "high",
+         "credentials": ["a:1", "b:2"]},
+        {"id": "B", "vendor": "Hikvision", "type": "backdoor_creds",
+         "description": "", "severity": "high",
+         "credentials": ["b:2", "c:3"]},
+    ]}), encoding="utf-8")
+
+    srv = await make_server("scanner", valid_cred="nobody:nothing")
+    seen = []
+    original = RTSPClient.connect
+
+    def _spy(self):
+        seen.append(self.credentials)
+        return original(self)
+
+    RTSPClient.connect = _spy
+    try:
+        db = CVEDatabase(db_path)
+        client = RTSPClient(srv.host, srv.port, 1.0, ":")
+        await client.connect()
+        report.CVE_LOG_FILE = None
+        seen.clear()
+        await run_cve_stage(srv.host, client, "Hikvision", db, 8, 0.05, {},
+                            http_ports=[], routes=["/"])
+        creds = [c for c in seen if c]
+        assert creds == ["a:1", "b:2", "c:3"]
+        assert len(creds) == len(set(creds))
+        client.close()
+    finally:
+        RTSPClient.connect = original
+        await srv.stop()
+
+
+async def test_run_cve_stage_generic_fallback_for_vendor_without_backdoor(
+    report_paths, tmp_path,
+):
+    """A vendor with no backdoor entry of its own still gets the shared
+    factory-default list instead of being skipped."""
+    from tests.mock_rtsp import make_server
+
+    db_path = tmp_path / "cve_db.json"
+    db_path.write_text(json.dumps({"cves": [
+        {"id": "A", "vendor": "Hikvision", "type": "backdoor_creds",
+         "description": "", "severity": "high",
+         "credentials": ["root:toor"]},
+        {"id": "GEN", "vendor": "Generic", "type": "backdoor_creds",
+         "description": "", "severity": "high",
+         "credentials": ["admin:defaultpw"]},
+    ]}), encoding="utf-8")
+
+    srv = await make_server("scanner", valid_cred="admin:defaultpw")
+    try:
+        db = CVEDatabase(db_path)
+        client = RTSPClient(srv.host, srv.port, 1.0, ":")
+        await client.connect()
+        report.CVE_LOG_FILE = None
+        # "Axis" has no entry at all -> must fall back to the Generic list.
+        found = await run_cve_stage(
+            srv.host, client, "Axis", db, 8, 0.05, {},
+            http_ports=[], routes=["/"],
+        )
+        assert len(found) == 1
+        assert found[0].credentials == "admin:defaultpw"
+        client.close()
+    finally:
+        await srv.stop()
+
+
+async def test_run_cve_stage_own_backdoor_wins_over_generic(report_paths, tmp_path):
+    """A vendor that does ship backdoor credentials must not also get the
+    generic list appended - its own list is the authoritative one."""
+    from tests.mock_rtsp import make_server
+
+    db_path = tmp_path / "cve_db.json"
+    db_path.write_text(json.dumps({"cves": [
+        {"id": "A", "vendor": "Hikvision", "type": "backdoor_creds",
+         "description": "", "severity": "high",
+         "credentials": ["root:toor"]},
+        {"id": "GEN", "vendor": "Generic", "type": "backdoor_creds",
+         "description": "", "severity": "high",
+         "credentials": ["admin:defaultpw"]},
+    ]}), encoding="utf-8")
+
+    srv = await make_server("scanner", valid_cred="admin:defaultpw")
+    seen = []
+    original = RTSPClient.connect
+    RTSPClient.connect = lambda self: (seen.append(self.credentials),
+                                       original(self))[1]
+    try:
+        db = CVEDatabase(db_path)
+        client = RTSPClient(srv.host, srv.port, 1.0, ":")
+        await client.connect()
+        report.CVE_LOG_FILE = None
+        seen.clear()
+        found = await run_cve_stage(
+            srv.host, client, "Hikvision", db, 8, 0.05, {},
+            http_ports=[], routes=["/"],
+        )
+        assert found == []
+        assert "admin:defaultpw" not in seen
+        client.close()
+    finally:
+        RTSPClient.connect = original
+        await srv.stop()

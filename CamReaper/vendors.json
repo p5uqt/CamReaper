@@ -1,1 +1,130 @@
-[{"vendor": "Hikvision", "patterns": {"server_contains": ["Hikvision", "Hik"], "realm_regex": ".*", "description": "Hikvision IP cameras"}}, {"vendor": "Dahua", "patterns": {"server_contains": ["Dahua", "DahuaTech"], "realm_regex": ".*", "description": "Dahua IP cameras"}}, {"vendor": "Axis", "patterns": {"server_contains": ["Axis"], "realm_regex": ".*", "description": "Axis Communications cameras"}}, {"vendor": "Bosch", "patterns": {"server_contains": ["Boltek", "Bosch"], "realm_regex": ".*", "description": "Bosch security cameras"}}, {"vendor": "ONVIF", "patterns": {"server_contains": ["ONVIF"], "realm_regex": ".*", "description": "ONVIF-compliant devices"}}, {"vendor": "Instar", "patterns": {"server_contains": ["Instar"], "realm_regex": ".*", "description": "Instar IP cameras"}}, {"vendor": "Amcrest", "patterns": {"server_contains": ["Amcrest"], "realm_regex": ".*", "description": "Amcrest IP cameras"}}, {"vendor": "TP-Link", "patterns": {"server_contains": ["TP-Link", "Tapo"], "realm_regex": ".*", "description": "TP-Link Tapo cameras"}}, {"vendor": "XMEye", "patterns": {"server_contains": ["XMEye"], "realm_regex": ".*", "description": "XMEye IP cameras"}}, {"vendor": "Generic", "patterns": {"server_contains": [], "realm_regex": ".*", "description": "Generic/unknown RTSP device"}}]
+[
+  {
+    "vendor": "Dahua",
+    "patterns": {
+      "server_contains": ["dahua", "dahuatech", "dh-"],
+      "realm_contains": ["dahua", "login to host", "dh-"],
+      "description": "Dahua IP cameras / NVR"
+    }
+  },
+  {
+    "vendor": "Xiongmai",
+    "patterns": {
+      "server_contains": ["xiongmai", "xmeye"],
+      "realm_contains": ["xiongmai", "xmeye"],
+      "description": "Xiongmai / XMEye based devices (also sold white-label)"
+    }
+  },
+  {
+    "vendor": "Sony",
+    "patterns": {
+      "server_contains": ["sony"],
+      "realm_contains": ["sony", "sccp"],
+      "description": "Sony network cameras"
+    }
+  },
+  {
+    "vendor": "V380",
+    "patterns": {
+      "server_contains": ["v380"],
+      "realm_contains": ["v380"],
+      "description": "V380 / V380 Pro home cameras"
+    }
+  },
+  {
+    "vendor": "AVTECH",
+    "patterns": {
+      "server_contains": ["avtech"],
+      "realm_contains": ["avtech"],
+      "description": "AVTECH DVR/NVR"
+    }
+  },
+  {
+    "vendor": "Netwave",
+    "patterns": {
+      "server_contains": ["netwave", "netwave-ip"],
+      "realm_contains": ["netwave"],
+      "description": "Netwave IP cameras (white-label DVRs)"
+    }
+  },
+  {
+    "vendor": "PTZOptics",
+    "patterns": {
+      "server_contains": ["ptzoptics", "valuehd"],
+      "realm_contains": ["ptzoptics", "valuehd"],
+      "description": "PTZOptics / ValueHD PTZ cameras"
+    }
+  },
+  {
+    "vendor": "Zosi",
+    "patterns": {
+      "server_contains": ["zosi", "zoscam"],
+      "realm_contains": ["zosi", "zoscam"],
+      "description": "Zosi home cameras"
+    }
+  },
+  {
+    "vendor": "Axis",
+    "patterns": {
+      "server_contains": ["axis"],
+      "realm_contains": ["axis"],
+      "description": "Axis Communications cameras"
+    }
+  },
+  {
+    "vendor": "Bosch",
+    "patterns": {
+      "server_contains": ["bosch", "bolin"],
+      "realm_contains": ["bosch", "bolin"],
+      "description": "Bosch security cameras"
+    }
+  },
+  {
+    "vendor": "TP-Link",
+    "patterns": {
+      "server_contains": ["tp-link", "tapo"],
+      "realm_contains": ["tp-link", "tapo"],
+      "description": "TP-Link Tapo cameras"
+    }
+  },
+  {
+    "vendor": "Instar",
+    "patterns": {
+      "server_contains": ["instar"],
+      "realm_contains": ["instar"],
+      "description": "Instar IP cameras"
+    }
+  },
+  {
+    "vendor": "Amcrest",
+    "patterns": {
+      "server_contains": ["amcrest"],
+      "realm_contains": ["amcrest"],
+      "description": "Amcrest IP cameras"
+    }
+  },
+  {
+    "vendor": "ONVIF",
+    "patterns": {
+      "server_contains": ["onvif"],
+      "realm_contains": ["onvif"],
+      "description": "ONVIF-compliant devices"
+    }
+  },
+  {
+    "vendor": "Hikvision",
+    "patterns": {
+      "server_contains": ["hikvision", "hik"],
+      "realm_contains": ["hikvision", "ip camera"],
+      "description": "Hikvision IP cameras (the 'IP Camera' realm is the broadest one)"
+    }
+  },
+  {
+    "vendor": "Generic",
+    "patterns": {
+      "server_contains": [],
+      "realm_contains": [],
+      "description": "Generic / unknown RTSP device - catch-all, always matched last"
+    }
+  }
+]

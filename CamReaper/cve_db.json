@@ -224,6 +224,35 @@
       "method": "GET",
       "success_patterns": ["V380", "config", "user", "pass"],
       "severity": "high"
+    },
+    {
+      "id": "GEN-CAM-DEFAULTS",
+      "vendor": "Generic",
+      "type": "backdoor_creds",
+      "description": "Factory default credentials still in place on an unidentified camera/NVR (not a single CVE - the default-password class they all share; tried for every vendor that ships no specific backdoor)",
+      "credentials": [
+        "admin:admin",
+        "admin:password",
+        "admin:12345",
+        "admin:123456",
+        "admin:1234",
+        "admin:admin123",
+        "root:root",
+        "root:vizxv",
+        "root:xc3511",
+        "root:admin",
+        "root:juantech",
+        "root:54321",
+        "root:pass",
+        "root:12345",
+        "user:user",
+        "guest:guest",
+        "supervisor:supervisor",
+        "operator:operator",
+        "service:service",
+        "ubnt:ubnt"
+      ],
+      "severity": "high"
     }
   ]
 }

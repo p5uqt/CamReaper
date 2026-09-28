@@ -640,3 +640,77 @@ async def test_error_samples_are_kept_for_diagnosis(report_paths, monkeypatch):
     assert stats["checked"] == 1
     assert stats["errors"] == 1
     assert stats["error_samples"] == ["127.0.0.9: ValueError: nope"]
+
+
+# --- ONVIF stage -------------------------------------------------------------
+
+
+async def test_onvif_stage_finds_stream_the_route_sweep_missed(report_paths):
+    """The RTSP route sweep only gets "/" plus the shipped guesses; ONVIF asks
+    the device and gets its own (here: non-standard) channel path back."""
+    from tests.mock_rtsp import make_server as rtsp_server
+    from tests.mock_onvif import make_server as onvif_server
+
+    rtsp = await rtsp_server(
+        "named-route-auth", valid_cred="admin:admin",
+        open_route="/Streaming/Channels/MainStream",
+    )
+    onvif = await onvif_server(auth="wsse", valid_cred="admin:admin",
+                               rtsp_port=rtsp.port)
+    try:
+        stats = await _scan(
+            rtsp, ["admin:admin"], routes=["/", "/stream1"],
+            onvif=True, onvif_ports=[onvif.port],
+            onvif_timeout=2.0, onvif_creds=["admin:admin"],
+        )
+        assert stats["found"] == 1
+        assert stats.get("onvif_found") == 1
+        line = report_paths.read_text()
+        assert "/Streaming/Channels/MainStream" in line
+        assert "admin:admin" in line
+    finally:
+        await onvif.stop()
+        await rtsp.stop()
+
+
+async def test_onvif_stage_requires_rtsp_verification(report_paths):
+    """A GetStreamUri answer is not proof the stream plays - a profile can be
+    disabled. The stage must confirm it over RTSP before reporting it."""
+    from tests.mock_rtsp import make_server as rtsp_server
+    from tests.mock_onvif import make_server as onvif_server
+
+    # The device hands out /Streaming/Channels/MainStream, but this RTSP server
+    # accepts nothing at all, so verification must reject the result.
+    rtsp = await rtsp_server("auth-401")
+    onvif = await onvif_server(auth=None, valid_cred="admin:admin",
+                               rtsp_port=rtsp.port)
+    try:
+        stats = await _scan(
+            rtsp, [], routes=["/"], mode="cve",
+            onvif=True, onvif_ports=[onvif.port], onvif_timeout=2.0,
+            onvif_creds=[""],
+        )
+        assert stats.get("onvif_found", 0) == 0
+        assert stats["found"] == 0
+    finally:
+        await onvif.stop()
+        await rtsp.stop()
+
+
+async def test_onvif_stage_disabled_by_default(report_paths):
+    """Without --onvif / the cve-mode preset the ONVIF ports are never touched."""
+    from tests.mock_rtsp import make_server as rtsp_server
+    from tests.mock_onvif import make_server as onvif_server
+
+    rtsp = await rtsp_server(
+        "named-route-auth", valid_cred="admin:admin",
+        open_route="/Streaming/Channels/MainStream",
+    )
+    onvif = await onvif_server(auth=None, rtsp_port=rtsp.port)
+    try:
+        stats = await _scan(rtsp, ["admin:admin"], routes=["/"])
+        assert stats["found"] == 0
+        assert not onvif.requests
+    finally:
+        await onvif.stop()
+        await rtsp.stop()

