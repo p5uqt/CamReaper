@@ -60,6 +60,7 @@ class MockRTSPServer:
         routes_404=None,
         server_header="Mock",
         close_on_unknown=False,
+        hang_routes=None,
     ):
         self.mode = mode
         self.valid_cred = valid_cred
@@ -71,10 +72,16 @@ class MockRTSPServer:
         # of real units answer a wrong route exactly like that instead of with
         # a 404, and a scan must not read it as "the host is dead".
         self.close_on_unknown = close_on_unknown
+        # Routes the camera accepts but never answers: the client burns a full
+        # socket timeout on each.  A real camera does this on *some* of the
+        # paths it does not serve, scattered through the wordlist, so this
+        # reproduces the pattern that used to truncate a long route sweep.
+        self.hang_routes = set(hang_routes or ())
         self.host = "127.0.0.1"
         self.port = None
         self.server = None
         self.requests = []
+        self.conns = 0
         self._session_poisoned = weakref.WeakKeyDictionary()
 
     async def start(self):
@@ -123,6 +130,12 @@ class MockRTSPServer:
                 data = await asyncio.wait_for(reader.read(65536), timeout=5)
                 text = data.decode("utf-8", "replace")
                 self.requests.append(text)
+                if self._extract_route(text) in self.hang_routes:
+                    # Accept, then never answer: the client burns a full socket
+                    # timeout on this path.  Never recorded in `requests` as a
+                    # completed exchange, so tests can count probes separately.
+                    await asyncio.sleep(60)
+                    return
                 valid = self._creds_ok(text)
                 # "session poisoning": a route-open camera that already answered
                 # 401 on THIS socket refuses even its open route afterwards, until
@@ -251,6 +264,7 @@ class MockRTSPServer:
 async def make_server(
     mode, valid_cred="admin:admin", silent_after=None, open_route=None,
     routes_404=None, server_header="Mock", close_on_unknown=False,
+    hang_routes=None,
 ):
     srv = MockRTSPServer(
         mode=mode,
@@ -260,6 +274,7 @@ async def make_server(
         routes_404=routes_404,
         server_header=server_header,
         close_on_unknown=close_on_unknown,
+        hang_routes=hang_routes,
     )
     await srv.start()
     return srv

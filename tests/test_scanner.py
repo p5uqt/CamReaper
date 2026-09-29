@@ -364,6 +364,220 @@ async def test_route_parallel_serial_equivalence(report_paths):
         await srv.stop()
 
 
+# A route wordlist long enough that a stripe actually has to walk.  The bug this
+# guards against was invisible at the default 11 entries, where a stripe only
+# ever probes one or two routes and can never die early.
+_LONG_WORDLIST = [f"/r{i}" for i in range(200)]
+
+
+def _stripe_of(index: int, workers: int) -> int:
+    """Which round-robin stripe (``routes[i::workers]``) owns this index."""
+    return index % workers
+
+
+async def test_long_route_list_survives_scattered_hanging_paths(report_paths):
+    """Regression: a LONG route wordlist must reach its tail.
+
+    The sweep used to abandon a stripe after ``--max-transport-fails``
+    *consecutive* timeouts.  That threshold was tuned for the 11-entry default
+    list, where a stripe probes one or two routes.  On a 200-entry list a stripe
+    walks ~50 routes, and two paths in a row that the camera accepts but never
+    answers - which real cameras do on paths they do not serve - discarded every
+    route below that point.  Net effect: a longer wordlist found FEWER cameras.
+
+    The camera here hangs on exactly two adjacent-in-stripe pairs, which is
+    enough to kill the stripe owning the open route under the old rule, while
+    being 2% of all probes - far below any sane give-up rate.
+    """
+    from tests.mock_rtsp import make_server
+
+    workers = 8
+    open_route = "/r199"
+    routes = list(_LONG_WORDLIST[:-1]) + [open_route]
+    assert _stripe_of(199, workers) == 7  # the open route lives in stripe 7
+
+    # Two hanging paths inside stripe 7 (it walks 7, 15, 23, ...).
+    hang = {routes[7], routes[15]}
+    srv = await make_server("route-open", open_route=open_route, hang_routes=hang)
+    try:
+        stats = await _scan(
+            srv, creds=["admin:admin"], routes=routes, route_parallel=workers
+        )
+        assert stats["found"] == 1
+        assert open_route in report_paths.read_text()
+    finally:
+        await srv.stop()
+
+
+async def test_long_route_list_survives_scattered_hanging_paths_serial(report_paths):
+    """The same regression on the serial path (--route-parallel 1)."""
+    from tests.mock_rtsp import make_server
+
+    open_route = "/r199"
+    routes = list(_LONG_WORDLIST[:-1]) + [open_route]
+    hang = {routes[7], routes[15], routes[8], routes[16]}
+    srv = await make_server("route-open", open_route=open_route, hang_routes=hang)
+    try:
+        stats = await _scan(
+            srv, creds=["admin:admin"], routes=routes, route_parallel=1
+        )
+        assert stats["found"] == 1
+        assert open_route in report_paths.read_text()
+    finally:
+        await srv.stop()
+
+
+async def test_route_sweep_survives_refused_connects(report_paths, monkeypatch):
+    """A dropped TCP connect must not discard the rest of a stripe.
+
+    ``workers`` stripes open sockets at the same time against one camera, and a
+    camera with a tiny accept backlog makes the kernel drop some of them.  The
+    old code treated a failed ``connect()`` as "the host is gone" and returned,
+    throwing away the ~50 routes the stripe had left over one dropped SYN.
+
+    A local mock cannot produce this - the kernel always completes the
+    handshake on loopback - so the failure is injected on the connect itself.
+    """
+    from CamReaper.rtsp import RTSPClient, Status
+    from tests.mock_rtsp import make_server
+
+    real_connect = RTSPClient.connect
+    calls = {"n": 0}
+
+    async def flaky_connect(self, port=None):
+        calls["n"] += 1
+        if calls["n"] % 3 == 0:
+            # Backlog overflow: the SYN was dropped, no connection at all.
+            self.status = Status.TIMEOUT
+            self.last_error = "refused"
+            self.reader = self.writer = None
+            return False
+        return await real_connect(self, port)
+
+    monkeypatch.setattr(RTSPClient, "connect", flaky_connect)
+
+    open_route = "/r199"
+    routes = list(_LONG_WORDLIST[:-1]) + [open_route]
+    srv = await make_server("route-open", open_route=open_route)
+    try:
+        stats = await _scan(
+            srv, creds=["admin:admin"], routes=routes, route_parallel=8
+        )
+        assert calls["n"] > 10, "the injection never engaged"
+        assert stats["found"] == 1
+        assert open_route in report_paths.read_text()
+    finally:
+        await srv.stop()
+
+
+async def test_probe_all_routes_collects_every_channel(report_paths):
+    """``probe_all_routes`` (the --scan-channels path) sweeps with
+    ``first_only=False`` and must return EVERY open route, not just the first.
+
+    It shares ``_sweep_routes`` with the single-hit sweep, so the give-up rule
+    has to keep working when no early exit is available: a multi-channel camera
+    whose wordlist contains a couple of hanging paths must still yield every
+    channel instead of stopping at the first hang burst.
+    """
+    from CamReaper.scanner import probe_all_routes
+    from CamReaper.rtsp import RTSPClient
+    from tests.mock_rtsp import make_server
+
+    # 200 on every route except "/" - a multi-channel unit.
+    routes = [f"/ch{i}" for i in range(60)]
+    # Two adjacent-in-stripe pairs of paths the camera never answers.  These
+    # used to kill the whole stripe, hiding every channel behind them.
+    hang = {routes[0], routes[4], routes[1], routes[5]}
+    srv = await make_server("open-except-root", hang_routes=hang)
+    try:
+        client = RTSPClient(srv.host, srv.port, 1.0, "admin:admin")
+        found = await probe_all_routes(
+            client, routes, "admin:admin", route_parallel=4
+        )
+        assert set(found) == set(routes) - hang
+    finally:
+        await srv.stop()
+
+
+async def test_route_sweep_still_bails_out_on_a_mute_camera(report_paths):
+    """The rate rule must NOT make a genuinely silent camera expensive.
+
+    A host that answers nothing is abandoned after a handful of probes per
+    stripe, so a 200-entry wordlist still costs only a few timeouts instead of
+    200.  This is the property the old consecutive-count rule was there for, and
+    it is the reason the replacement is rate-based rather than "never give up".
+    """
+    from tests.mock_rtsp import make_server
+
+    routes = list(_LONG_WORDLIST)
+    srv = await make_server("silent")
+    try:
+        stats = await _scan(
+            srv, creds=["admin:admin"], routes=routes, route_parallel=8
+        )
+        assert stats["found"] == 0
+        # 8 stripes x (_MUTE_EVIDENCE + 1) probes is the ceiling; a generous
+        # bound still proves the walk is not running the whole wordlist.
+        assert len(srv.requests) < len(routes)
+    finally:
+        await srv.stop()
+
+
+async def test_max_transport_fails_raises_tolerance_not_ignored(report_paths):
+    """--max-transport-fails stays meaningful: a run of hanging paths longer than
+    the default is tolerated when the user raises it, instead of the flag being
+    silently ignored by the rate rule."""
+    from tests.mock_rtsp import make_server
+
+    open_route = "/r199"
+    routes = list(_LONG_WORDLIST[:-1]) + [open_route]
+    # A run of hanging paths right at the start of the sweep, longer than the
+    # default MAX_TRANSPORT_FAILS of 2.
+    hang = {routes[i] for i in range(6)}
+    srv = await make_server("route-open", open_route=open_route, hang_routes=hang)
+    try:
+        stats = await _scan(
+            srv, creds=["admin:admin"], routes=routes, route_parallel=8
+        )
+        assert stats["found"] == 1  # 6 failures / 200 probes is a low rate
+    finally:
+        await srv.stop()
+
+
+async def test_failure_budget_rate_semantics():
+    """Unit contract of the give-up rule.
+
+    * a run of failures shorter than the floor never abandons the walk;
+    * a host that fails *every* probe is abandoned exactly at the floor, so a
+      mute camera stays cheap no matter how long the wordlist is;
+    * any answer resets the consecutive run, so a camera that hangs on a
+      scattered subset of paths is never given up on.
+    """
+    from CamReaper.scanner import _MUTE_EVIDENCE, _FailureBudget
+
+    for requested in (2, 8, 50):
+        budget = _FailureBudget(requested)
+        effective = max(requested, _MUTE_EVIDENCE)
+        # Nothing is given up while the run stays under the floor...
+        for _ in range(effective - 1):
+            assert budget.fail() is False
+        # ...but a host failing every single probe goes exactly at the floor.
+        assert budget.fail() is True
+
+    # Scattered failures: an answer between each one keeps the walk alive.
+    budget = _FailureBudget(2)
+    for _ in range(500):
+        budget.fail()
+        budget.ok()
+    assert budget.fail() is False  # 501 failures, but never a long run
+
+    # A host that answers everything is never abandoned.
+    budget = _FailureBudget(2)
+    for _ in range(1000):
+        budget.ok()
+    assert budget.fail() is False
+
+
 async def test_open_dummy_route_not_recorded_as_root(report_paths):
     """A camera that 200s arbitrary routes but gates '/' (good parser for the
     old bug: the dummy-route probe answered 200 and a fake rtsp://ip:port/ was

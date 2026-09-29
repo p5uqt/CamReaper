@@ -38,6 +38,53 @@ PORT_PARALLEL = 4
 
 AUTH_CODES = {"401", "403"}
 
+# A route walk is abandoned when the host has failed to answer on MORE THAN HALF
+# of the routes it has actually probed, and only once at least this many
+# failures have piled up.  The rule used to be "MAX_TRANSPORT_FAILS consecutive
+# timeouts and the walk is over", which was implicitly tuned for the 11-entry
+# default wordlist where a stripe walks one or two routes.  With an 800-entry
+# list a stripe walks ~100 routes, and two hanging paths in a row - which plenty
+# of cameras do on paths they do not serve - silently discarded everything
+# below that point, so the tail of a long wordlist was never probed and a
+# *longer* route list found *fewer* cameras.
+#
+# A rate separates "this camera hangs on some paths" from "this host is gone",
+# and it keeps the fast bail-out for a genuinely mute camera: a dead host fails
+# every probe, so the ratio trips within the first few routes.  Tolerance grows
+# as the walk proceeds, because each answer proves the host is alive - a hang
+# burst late in a long walk is far less suspicious than one at its very start.
+_MUTE_EVIDENCE = 4
+
+
+class _FailureBudget:
+    """Give-up rule for a route walk, based on the *rate* of transport failures.
+
+    ``fail()`` returns True when the walk must be abandoned.  ``max_consecutive``
+    is the caller's ``--max-transport-fails`` and acts as a floor: a handful of
+    failing paths never costs the walk, so raising the flag buys tolerance
+    rather than being silently ignored.
+    """
+
+    __slots__ = ("_floor", "_probed", "_failed")
+
+    def __init__(self, max_consecutive: int) -> None:
+        self._floor = max(int(max_consecutive), _MUTE_EVIDENCE)
+        self._probed = 0
+        self._failed = 0
+
+    def ok(self) -> None:
+        """The host answered this route (a 404 or a hang-up counts as alive)."""
+        self._probed += 1
+        self._failed = 0
+
+    def fail(self) -> bool:
+        """Record one transport failure; True when the walk must be abandoned."""
+        self._probed += 1
+        self._failed += 1
+        if self._failed < self._floor:
+            return False
+        return self._failed * 2 > self._probed
+
 
 def _is_mute_host(client: RTSPClient, code: str) -> bool:
     """True when the host took the connection but never answered the request.
@@ -168,8 +215,8 @@ async def _probe_routes_serial(
     lazily so hosts that answer 200 immediately stay on the fast keep-alive
     path.
     """
-    mutes = 0
     need_fresh = False
+    budget = _FailureBudget(max_transport_fails)
     loop = asyncio.get_running_loop()
     for route in routes:
         if deadline is not None and loop.time() >= deadline:
@@ -178,23 +225,26 @@ async def _probe_routes_serial(
             client.close()
             need_fresh = False
         if not client.is_connected and not await _reconnect(client):
-            return None
+            # A dropped connect is not proof the host is gone - the camera's
+            # accept backlog can overflow under our own parallel stripes.
+            if budget.fail():
+                return None
+            continue
         code, _ = await try_auth(client, cred, route)
         if code == "200":
             return route
         if code in AUTH_CODES:
             need_fresh = True
-            mutes = 0
+            budget.ok()
             continue
         if _is_mute_host(client, code):
-            # Socket open, nothing came back: every further route would burn
-            # the same full timeout, so give up on this host.
-            mutes += 1
-            if mutes >= max_transport_fails:
+            # Socket open, nothing came back: count it, but only abandon the
+            # walk once the host is failing most of what we probe.
+            if budget.fail():
                 return None
             continue
-        if code:
-            mutes = 0
+        # A definitive status code - 404 included - means the host is talking.
+        budget.ok()
         # No status line, but a closed/refused socket: the camera hung up on us,
         # which is its normal "no such route" answer.  Reconnect and keep going.
         client.close()
@@ -228,7 +278,7 @@ async def _sweep_routes(
 
     async def _stripe(stripe_routes):
         client = RTSPClient(ip, port, timeout, ":")
-        mutes = 0
+        budget = _FailureBudget(max_transport_fails)
         try:
             for route in stripe_routes:
                 if stop is not None and stop.is_set():
@@ -237,31 +287,38 @@ async def _sweep_routes(
                     return
                 client.close()
                 if not await client.connect(port):
-                    return  # host gone: every other stripe would fail too
+                    # A failed connect is NOT proof the host is gone: `workers`
+                    # stripes opening sockets simultaneously overflow a camera's
+                    # tiny accept backlog and the kernel drops our SYN.  It used
+                    # to `return` here, discarding the ~100 routes this stripe
+                    # had left over a single dropped connection.  Account for it
+                    # like any other transport failure instead.
+                    if budget.fail():
+                        return
+                    continue
                 code, _ = await try_auth(client, cred, route)
                 if code == "200":
                     async with lock:
                         hits.append(route)
-                    mutes = 0
+                    budget.ok()
                     if stop is not None:
                         stop.set()
                         return
-                elif code in AUTH_CODES:
-                    mutes = 0
+                    continue
+                if code in AUTH_CODES:
+                    budget.ok()
                 elif _is_mute_host(client, code):
                     # The socket is open and the camera stayed silent: this is
-                    # the one failure that costs a full timeout, so a couple in
-                    # a row mean the rest of the stripe would burn time for
-                    # nothing.
-                    mutes += 1
-                    if mutes >= max_transport_fails:
+                    # the one failure that costs a full timeout, so count it -
+                    # but a couple in a row must not throw away the rest of a
+                    # long wordlist.
+                    if budget.fail():
                         return
                 else:
                     # No status line, but the camera hung up on us (or the
                     # route is a plain 404): that is its cheap "no such route"
                     # answer, so the stripe keeps going instead of giving up.
-                    if code:
-                        mutes = 0
+                    budget.ok()
         except Exception:
             pass
         finally:
