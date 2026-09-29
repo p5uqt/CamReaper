@@ -6,6 +6,6 @@ admin:admin
 admin:(null)
 default:tluafed
 guest:guest
-guest:12345
 tapo_admin:tapo_admin
 user:user
+guest:12345
