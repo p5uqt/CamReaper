@@ -46,7 +46,14 @@ setuptools.setup(
     # them and every default -r / -c / vendor lookup / --mode cve run failed
     # with FileNotFoundError.
     package_data={
-        "CamReaper": ["defroutes", "defcreds", "vendors.json", "cve_db.json"]
+        "CamReaper": [
+            "defroutes",
+            "defcreds",
+            "defroutes.fast",
+            "defcreds.fast",
+            "vendors.json",
+            "cve_db.json",
+        ]
     },
     include_package_data=True,
     entry_points={"console_scripts": ["CamReaper = CamReaper.__main__:main"]},

@@ -85,6 +85,41 @@ async def test_auth_required_returns_401(mock):
     assert c.nonce == "n1"
 
 
+async def test_parse_basic_and_digest_challenges_together():
+    data = (
+        "RTSP/1.0 401 Unauthorized\r\n"
+        'WWW-Authenticate: Basic realm="Cam"\r\n'
+        'WWW-Authenticate: Digest realm="r", nonce="n1", '
+        'qop="auth,auth-int", algorithm=MD5, opaque="op"\r\n\r\n'
+    )
+    challenges = RTSPClient._parse_auth_challenges(data)
+    assert challenges["basic"]["realm"] == "Cam"
+    assert challenges["digest"]["nonce"] == "n1"
+    assert challenges["digest"]["opaque"] == "op"
+
+    c = RTSPClient("127.0.0.1", 554, timeout=1)
+    c._update_challenge(data)
+    # Digest wins when both are offered, and its parameters are retained.
+    assert c.auth_scheme == "digest"
+    assert c.qop == "auth"
+    assert c.opaque == "op"
+    assert (c.realm, c.nonce) == ("r", "n1")
+
+
+async def test_basic_challenge_does_not_keep_a_digest_nonce():
+    c = RTSPClient("127.0.0.1", 554, timeout=1)
+    c._update_challenge(
+        'RTSP/1.0 401 Unauthorized\r\n'
+        'WWW-Authenticate: Digest realm="r", nonce="n1"\r\n\r\n'
+    )
+    c._update_challenge(
+        'RTSP/1.0 401 Unauthorized\r\n'
+        'WWW-Authenticate: Basic realm="Cam"\r\n\r\n'
+    )
+    assert c.auth_scheme == "basic"
+    assert c.nonce == ""
+
+
 @pytest.mark.parametrize("mock", ["digest-auth"], indirect=True)
 async def test_digest_two_step(mock):
     c = RTSPClient(mock.host, mock.port, timeout=2, credentials="admin:admin")

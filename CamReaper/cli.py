@@ -198,6 +198,18 @@ class PortList(argparse.Action):
                     seen.add(number)
                     ports.append(number)
         setattr(namespace, self.dest, ports)
+        if option_string in ("-p", "--ports"):
+            # --profile max adds common camera ports only when -p is omitted;
+            # remember that the user supplied their own list.
+            setattr(namespace, "_ports_explicit", True)
+
+
+class ModeAction(argparse.Action):
+    """Record that --mode was supplied explicitly, for --profile max."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, "_mode_explicit", True)
 
 
 def non_negative_int(value: Any):
@@ -261,6 +273,21 @@ parser = HelpParser(
     description=_DESCRIPTION,
     epilog=_EPILOG,
     formatter_class=CustomHelpFormatter,
+)
+
+# -- scan profile -------------------------------------------------------------
+profile_group = parser.add_argument_group("scan profile")
+profile_group.add_argument(
+    "--profile",
+    choices=("fast", "balanced", "max"),
+    default="fast",
+    help=(
+        "'fast' = pre-profile speed: small wordlists, no ONVIF, no deep-auth, "
+        "first responsive port only; 'balanced' = fast plus ONVIF/deep-auth "
+        "and all ports; 'max' = balanced plus the community wordlists, common "
+        "camera ports, CVE mode and a larger per-host budget. Explicit flags "
+        "still override the profile where noted"
+    ),
 )
 
 # -- targets and wordlists ----------------------------------------------------
@@ -358,6 +385,7 @@ exploit_group.add_argument(
     "--mode",
     choices=["brute", "cve", "combined"],
     default="brute",
+    action=ModeAction,
     help=(
         "'brute' = credentials only, 'cve' = exploits only, 'combined' = "
         "exploits first, then brute-force for hosts still unfound"
@@ -409,14 +437,17 @@ exploit_group.add_argument(
     action="store_true",
     help=(
         "ask each host for its stream URL over ONVIF (SOAP GetProfiles / "
-        "GetStreamUri) instead of guessing RTSP routes. Implied by 'cve' and "
-        "'combined'; use it to enable ONVIF in 'brute' mode"
+        "GetStreamUri). ONVIF is on by default; this flag is kept for "
+        "compatibility and explicitness"
     ),
 )
 exploit_group.add_argument(
     "--no-onvif",
     action="store_true",
-    help="disable ONVIF discovery even in 'cve'/'combined' mode",
+    help=(
+        "disable ONVIF discovery (default is on). Use it for very large or "
+        "latency-sensitive scans"
+    ),
 )
 exploit_group.add_argument(
     "--onvif-ports",
@@ -477,13 +508,36 @@ perf_group.add_argument(
     ),
 )
 perf_group.add_argument(
+    "--port-parallel",
+    default=None,
+    type=positive_int,
+    metavar="N",
+    help=(
+        "how many ports of one IP are probed at once. Default depends on "
+        "--profile (fast 4, balanced 8, max 16); raise it for a single test "
+        "server with a large port range"
+    ),
+)
+perf_group.add_argument(
+    "--port-pipeline-parallel",
+    default=None,
+    type=positive_int,
+    metavar="N",
+    help=(
+        "how many responsive ports of the same IP are run through the "
+        "route/credential pipeline at once. Default depends on --profile "
+        "(fast 1, balanced 8, max 16). A test server or NVR can expose many "
+        "cameras on one address"
+    ),
+)
+perf_group.add_argument(
     "--max-attempts",
     default=0,
     type=int,
     metavar="N",
     help=(
-        "credential attempts per host before giving up (0 = unlimited). Use "
-        "this to avoid triggering the camera's failed-login lockout"
+        "credential attempts per RTSP port/camera before giving up (0 = "
+        "unlimited). Use this to avoid triggering the failed-login lockout"
     ),
 )
 perf_group.add_argument(
@@ -498,13 +552,42 @@ perf_group.add_argument(
     ),
 )
 perf_group.add_argument(
+    "--deep-auth",
+    dest="deep_auth",
+    action="store_true",
+    default=None,
+    help=(
+        "after the normal '/' password pass fails, try the remaining "
+        "credentials against a short list of real stream routes. Finds cameras "
+        "that answer 401 even for the correct password on '/'. On by default "
+        "in balanced/max, off in fast"
+    ),
+)
+perf_group.add_argument(
+    "--no-deep-auth",
+    dest="deep_auth",
+    action="store_false",
+    default=None,
+    help="disable the second credential pass over stream routes",
+)
+perf_group.add_argument(
+    "--deep-auth-routes",
+    default=None,
+    type=positive_int,
+    metavar="N",
+    help=(
+        "how many stream routes the second credential pass may try. Default "
+        "depends on --profile (balanced 40, max 64)"
+    ),
+)
+perf_group.add_argument(
     "--attempts-per-sec",
     default=0.0,
     type=float,
     metavar="N",
     help=(
-        "cap credential attempts per host per second (0 = no limit). Slows "
-        "brute-force against one host to dodge lockouts"
+        "cap credential attempts per RTSP port/camera per second (0 = no "
+        "limit). Slows brute-force against one camera to dodge lockouts"
     ),
 )
 perf_group.add_argument(
@@ -520,12 +603,13 @@ perf_group.add_argument(
 )
 perf_group.add_argument(
     "--host-timeout",
-    default=0.0,
+    default=None,
     type=float,
     metavar="S",
     help=(
         "wall-clock budget for one host's whole pipeline (0 = unlimited). "
-        "Stops flaky cameras from occupying a slot for minutes"
+        "Default depends on --profile (fast 0, balanced 60, max 300). Stops "
+        "flaky cameras from occupying a slot for minutes"
     ),
 )
 perf_group.add_argument(

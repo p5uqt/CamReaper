@@ -10,9 +10,11 @@ Scans networks for RTSP camera streams, brute-forces routes and credentials, cap
 
 - **Async architecture** - asyncio event loop with bounded concurrency, no blocking threads. See the Russian documentation [README.ru.md](README.ru.md) for the localized version.
 - **Route discovery** - parallel route probing across the built-in list of common vendor paths (ONVIF, Dahua, Hikvision, Uniview, Axis, Samsung, Panasonic, Tapo, etc.). Larger community lists are shipped in `routecreds/` (e.g. `routecreds/routes.txt`, 810+ paths) and can be passed with `-r`
-- **Parallel port probing** - the `-p` ports of a host are probed concurrently (4 at a time), so a multi-port scan is no longer serial. The port of record is still the first responsive port in the order you gave
+- **Scan profiles** - `fast` is the default and restores the pre-profile speed (small wordlists, no ONVIF/deep-auth, first port only); `--profile balanced` and `--profile max` spend more time to find more devices
+- **Parallel port probing** - the `-p` ports of a host are probed concurrently, so a multi-port scan is no longer serial. In `balanced`/`max` **every** responsive port is processed, so a test server or NVR that exposes many cameras on one IP yields all of them, not just the first
 - **Lazily expanded targets** - IPs, CIDRs and ranges are generated on the fly, so `-t 10.0.0.0/8` costs no memory; a host-prefixed CIDR such as `192.168.1.5/24` is accepted and resolved to the containing network
-- **Credential brute-force** - Basic and Digest (two-step) authentication
+- **Credential brute-force** - Basic and Digest authentication, including RFC 2617 `qop=auth`, `opaque` and SHA-256 algorithms; a second pass tries the password on real stream routes when `/` keeps returning 401
+- **Any RTSP answer counts** - a camera that replies `404`/`400` to an unknown path is treated as live and swept, not discarded as "unconfirmed"
 - **Screenshots** - FFmpeg-based capture with hard timeout (subprocess isolation)
 - **HTML gallery** - click to copy RTSP URL, double-click for fullscreen
 - **Multi-channel expansion** - Hikvision 101-1601, Dahua ch1-8, ONVIF channel/subtype
@@ -50,7 +52,19 @@ CamReaper -t targets.txt -p 554 8000-8008 8554
 CamReaper -t ips.txt -r routes.txt -c combos.txt -ct 500 -T 1
 
 # Fast scan without screenshots
-CamReaper -t broad_cidr.txt --no-screenshots -p 554
+CamReaper -t broad_cidr.txt --no-screenshots -p 554 --profile fast
+
+# Pre-profile speed: small wordlists, no ONVIF, no deep-auth, first port only
+CamReaper -t targets.txt --profile fast
+
+# More coverage: ONVIF + deep-auth + every responsive port
+CamReaper -t targets.txt --profile balanced
+
+# Maximum findings: community wordlists, common ports, CVE mode
+CamReaper -t targets.txt --profile max
+
+# All ports, but no expensive ONVIF/deep-auth stages
+CamReaper -t test-server -p 5000-5100 --profile balanced --no-onvif --no-deep-auth
 ```
 
 ---
@@ -67,19 +81,37 @@ CamReaper [OPTIONS]
 |------|-------------|
 | `-t, --targets SPEC` | Targets: a file with one entry per line, or an inline spec (CIDR, range, or comma/space separated IPs) |
 
+### Scan profile
+
+| Profile | What it changes |
+|---------|-----------------|
+| `fast` (default) | Pre-profile behaviour: the original 11 routes / 11 credentials, **no ONVIF**, **no deep-auth**, only the first responsive port, old `404` rules, no per-host budget. This is what runs when `--profile` is omitted. |
+| `balanced` | ONVIF + deep-auth + every responsive port + the expanded built-in wordlists (36 routes / 52 credentials) + a 60s host budget. |
+| `max` | Balanced plus the community lists from `routecreds/` (830+ routes, 200+ credentials), common camera ports when `-p` is not given, `--mode combined`, 16 port probes/pipelines at once and a 300s host budget. Slowest, but finds the most. |
+
+Explicit flags still override the profile where it makes sense (`-p`, `-r`,
+`-c`, `--mode`, `--onvif`/`--no-onvif`, `--deep-auth`/`--no-deep-auth`,
+`--host-timeout`, concurrency and route counts).
+
 ### Scan Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-p, --ports PORTS` | `554` | RTSP ports to scan; ranges allowed (`8000-8008`); probed 4 at a time per host, first responsive port wins |
-| `-r, --routes FILE` | built-in | Custom route list |
-| `-c, --credentials FILE` | built-in | Credential list (`user:pass` per line) |
+| `--profile NAME` | `fast` | `fast`, `balanced` or `max`; see the table above |
+| `-p, --ports PORTS` | `554` | RTSP ports to scan; ranges allowed (`8000-8008`); probed in parallel per host, every responsive port is processed (`fast` keeps only the first). `max` adds common camera ports when `-p` is omitted |
+| `-r, --routes FILE` | profile | Custom route list; `fast` uses 11 paths, `balanced` 36, `max` the community list |
+| `-c, --credentials FILE` | profile | Credential list (`user:pass` per line); `fast` uses 11, `balanced` 52, `max` the community list |
 | `-ct, --check-concurrency N` | `300` | Max concurrent host pipelines |
 | `-T, --timeout S` | `2.0` | Socket timeout in seconds |
-| `--max-attempts N` | `0` (unlimited) | Cap credential attempts per host |
-| `--attempts-per-sec N` | `0` (none) | Rate limit per host |
-| `--host-timeout S` | `0` (unlimited) | Wall-clock budget per host |
+| `--max-attempts N` | `0` (unlimited) | Cap credential attempts per RTSP port/camera (also disables the deep pass) |
+| `--deep-auth` | profile | After the normal `/` pass fails, try the credentials against real stream routes. On in `balanced`/`max`, off in `fast` |
+| `--no-deep-auth` | - | Disable the second credential pass |
+| `--deep-auth-routes N` | profile | How many stream routes the second pass may try per camera (`balanced` 40, `max` 64) |
+| `--attempts-per-sec N` | `0` (none) | Rate limit per RTSP port/camera |
+| `--host-timeout S` | profile | Wall-clock budget per host (`fast` 0/unlimited, `balanced` 60, `max` 300) |
 | `--route-parallel N` | `8` | Routes probed in parallel (0 = serial) |
+| `--port-parallel N` | profile | Ports of one IP probed at once (`fast` 4, `balanced` 8, `max` 16) |
+| `--port-pipeline-parallel N` | profile | Responsive ports of the same IP run through the route/credential pipeline at once (`fast` 1, `balanced` 8, `max` 16) |
 | `--dedup` | off | Skip duplicate IPs from overlapping ranges |
 | `--dedup-size N` | `1000000` | LRU cache size for dedup |
 | `--exclude SPEC` | - | Skip a file/CIDR/range/IP; repeatable. Applied after `--dedup` |
@@ -88,17 +120,17 @@ CamReaper [OPTIONS]
 | `--limit N` | `0` (all) | Stop after N targets of this run |
 | `--count-only` | off | Print how many targets would be scanned and exit (no network) |
 | `--rate-limit N` | `0` (none) | Global cap on new connections per second across all hosts |
-| `--mode MODE` | `brute` | Scan strategy: `brute` (default), `cve` (CVE only), `combined` (CVE first, then brute) |
+| `--mode MODE` | `brute` | Scan strategy: `brute` (default), `cve` (CVE only), `combined` (CVE first, then brute). `max` uses `combined` when `--mode` is omitted |
 | `--cve-db PATH` | built-in | Path to a custom CVE database JSON file |
 | `--http-ports PORTS` | `80 443 8080` | HTTP/HTTPS ports probed for CVEs on hosts with no live RTSP port; ranges allowed (`8000-8008`) |
 | `--https-ports PORTS` | `443 8443` | Subset of `--http-ports` probed over TLS |
 | `--no-http` | off | Disable the HTTP CVE-probe fallback |
 | `--http-timeout S` | `5.0` | Socket timeout in seconds for CVE HTTP probes |
-| `--onvif` | off in `brute` | Ask each host for its stream URL over ONVIF (SOAP `GetProfiles`/`GetStreamUri`). Implied by `cve` and `combined` |
-| `--no-onvif` | off | Disable ONVIF discovery even in `cve`/`combined` mode |
-| `--onvif-ports PORTS` | `80 8000 8080 8899 2020 34567 5000 81 8081 9000 8082` | Web ports probed for the ONVIF device service; ranges allowed |
+| `--onvif` | profile | Ask each host for its stream URL over ONVIF (SOAP `GetProfiles`/`GetStreamUri`). On in `balanced`/`max`, off in `fast` |
+| `--no-onvif` | - | Disable ONVIF discovery |
+| `--onvif-ports PORTS` | `80 81 8000 8001 8080 8081 8082 8083 8088 8899 8888 2020 34567 5000 9000` | Web ports probed for the ONVIF device service; ranges allowed |
 | `--onvif-timeout S` | `5.0` | Socket timeout in seconds for ONVIF SOAP requests |
-| `--onvif-profiles N` | `4` | How many ONVIF profiles per device to resolve into RTSP URLs |
+| `--onvif-profiles N` | profile | How many ONVIF profiles per device to resolve into RTSP URLs (`max` 8) |
 
 ### Screenshot Options
 
@@ -214,15 +246,39 @@ CamReaper -t targets.txt --mode combined --no-http
 ### Scan with ONVIF discovery
 
 ```bash
-# ONVIF in the default brute mode
-CamReaper -t targets.txt --onvif
+# ONVIF is on by default in balanced/max
+CamReaper -t targets.txt --profile balanced
 
 # Only the vendor ports that actually serve ONVIF
-CamReaper -t targets.txt --onvif --onvif-ports 8000 8080 34567
+CamReaper -t targets.txt --onvif-ports 8000 8080 34567
 
 # Resolve more channels per device, and turn it off again
-CamReaper -t targets.txt --onvif --onvif-profiles 8
+CamReaper -t targets.txt --onvif-profiles 8
 CamReaper -t targets.txt --mode combined --no-onvif
+```
+
+### Maximum-findings command
+
+```bash
+# ONVIF on, CVE backdoors + web probes, expanded routes/credentials, deep
+# credential pass, and every common camera port.
+CamReaper -t targets.txt \
+  -p 554 8554 5554 10554 8000 8080 \
+  -r routecreds/routes.txt \
+  -c routecreds/credentials.txt \
+  --mode combined --check-concurrency 500 --deep-auth \
+  --port-parallel 32 --port-pipeline-parallel 16 --host-timeout 600
+
+# The same idea, without spelling all of it out:
+CamReaper -t targets.txt --profile max
+```
+
+For one test server that exposes cameras on a port range, scan the range
+directly - every responsive port is now processed:
+
+```bash
+CamReaper -t 10.0.0.5 -p 5000-5100 --port-parallel 64 \
+  --port-pipeline-parallel 16 --host-timeout 600 --deep-auth
 ```
 
 ---
@@ -249,6 +305,10 @@ following controls are designed to be combined:
 6. **Process the results** - `findings.jsonl` is JSON Lines: one object per
    confirmed stream, including vendor and CVE metadata, ready for
    `jq`/pandas/whatever without re-parsing RTSP URLs.
+7. **Budget ONVIF on very wide ranges** - ONVIF is on in `balanced`/`max` and
+   probes the HTTP ports of every host. It is gated and cheap, but for a
+   multi-million-IP sweep use `--no-onvif`, `--profile fast` or narrow
+   `--onvif-ports`.
 
 Progress output also reports the current hosts/second and an ETA derived from
 `--count-only`-style arithmetic (no target list is materialised).
@@ -311,8 +371,13 @@ device service's HTTP port (which is usually *not* the RTSP port):
 3. `POST` `GetStreamUri` per token, which returns the device's own `rtsp://` URL;
 4. confirm that URL over RTSP before reporting it.
 
-Enabled by `--onvif`, and implied by `--mode cve` / `--mode combined`. Disable
-with `--no-onvif`.
+ONVIF is off in the default `fast` profile and on in `balanced`/`max`. Disable
+it with `--no-onvif` for very large or latency-sensitive scans.
+
+It also runs when **no RTSP port answered at all**: ONVIF lives on an HTTP port,
+so a camera whose RTSP port is not in `-p` (or is closed) still hands out a
+playable `rtsp://` URL. A short TCP gate over the ONVIF ports keeps dead hosts
+cheap; only a port that accepts a connection gets the full SOAP flow.
 
 Authentication is attempted in order, each step cheap and many devices accepting
 more than one: no credentials at all, WS-Security `UsernameToken` with
@@ -321,8 +386,12 @@ more than one: no credentials at all, WS-Security `UsernameToken` with
 Cost is kept bounded in three ways: a port that is not serving ONVIF is
 rejected after a single anonymous request; the credential list is de-duplicated
 and capped; and at most `--onvif-profiles` tokens are resolved per device.
-Because the check happens only after the cheap RTSP route sweep comes up empty,
-a camera that answers `/` straight away pays nothing for it.
+Every verified profile is reported (main and sub-stream), and every responding
+ONVIF port is probed - not just the first - so a test server with several
+independent camera services on one address yields all of them.
+ONVIF is attempted only after the cheap RTSP route sweep on each live port, so
+a camera that answers `/` straight away pays only a short TCP gate; use
+`--no-onvif` to remove even that cost.
 
 ---
 

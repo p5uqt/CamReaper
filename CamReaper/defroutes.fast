@@ -1,0 +1,11 @@
+/0/1:1/main
+/
+/3
+/4
+/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif
+/h264/ch1/main/av_stream
+/h264/ch1/sub/av_stream
+/main/av_stream
+/stream1
+/superstream
+/user=admin&password=&channel=1&stream=0.sdp?

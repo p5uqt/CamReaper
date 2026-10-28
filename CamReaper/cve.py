@@ -251,7 +251,13 @@ async def _http_request_full(
             key = name.strip().lower()
             if not key:
                 continue
-            resp_headers[key] = value.strip()
+            value = value.strip()
+            if key == "www-authenticate" and key in resp_headers:
+                # A device can advertise Basic and Digest in two headers; the
+                # last one used to overwrite the first and hide Digest.
+                resp_headers[key] = resp_headers[key] + ", " + value
+            else:
+                resp_headers[key] = value
             if key == "server" and not server:
                 server = value.strip()
             elif key == "content-length":
@@ -394,8 +400,11 @@ async def find_backdoor_stream(
             code, _ = await try_auth(probe, cred, "/")
             if code == "200":
                 return cred, "/"
-            if code == "404":
-                # Valid creds, wrong route - sweep routes for a working one.
+            if code in ("404", "401", "403"):
+                # 404: valid creds, wrong route.  401/403: the root may not be
+                # a playable resource even with the right password, so the
+                # camera only opens on its real stream path.  Sweep routes for
+                # either case instead of discarding a working backdoor.
                 found_route = await probe_first_open_route(
                     ip, port, timeout, route_list, cred, route_parallel,
                 )

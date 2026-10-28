@@ -8,7 +8,14 @@ from pathlib import Path
 
 from tqdm.auto import tqdm
 
-from CamReaper import report, screenshot
+from CamReaper import (
+    DEFAULT_CREDENTIALS,
+    DEFAULT_ROUTES,
+    FAST_CREDENTIALS,
+    FAST_ROUTES,
+    report,
+    screenshot,
+)
 from CamReaper.cli import parser
 from CamReaper.gallery import build_from_urls, iter_url_list
 from CamReaper.scanner import Settings, run
@@ -37,12 +44,157 @@ def _load_list(path: Path) -> list:
     (``#``) are stripped too, so a list can be annotated.
     """
     out = []
+    seen = set()
     for raw in _load_lines(path):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
+        # Duplicate routes/credentials only waste probes and login attempts.
+        if line in seen:
+            continue
+        seen.add(line)
         out.append(line)
     return out
+
+
+# Ports commonly used by cameras/DVRs.  The "max" profile adds these only when
+# the user did not pass an explicit -p list.
+COMMON_RTSP_PORTS = [554, 8554, 5554, 10554, 8000, 8080]
+
+# Community wordlists shipped in the source tree.  A wheel install does not
+# contain them, so "max" falls back to the built-in lists when absent.
+_ROUTECREDS_DIR = Path(__file__).resolve().parent.parent / "routecreds"
+_BIG_ROUTES = _ROUTECREDS_DIR / "routes.txt"
+_BIG_CREDENTIALS = _ROUTECREDS_DIR / "credentials.txt"
+
+# What each profile changes.  Explicit command-line options still win.
+PROFILES = {
+    "fast": {
+        # Pre-profile behaviour: the original small wordlists, no ONVIF, no
+        # deep pass, only the first responsive port, and the old 404 rules.
+        "onvif": False,
+        "deep_auth": False,
+        "all_ports": False,
+        "any_status_live": False,
+        "retry_after_404": False,
+        "port_parallel": 4,
+        "port_pipeline_parallel": 1,
+        "deep_auth_routes": 40,
+        "host_timeout": 0.0,
+        "onvif_profiles": 4,
+        "mode": None,
+        "ports": None,
+        "use_big_wordlists": False,
+        "routes": FAST_ROUTES,
+        "credentials": FAST_CREDENTIALS,
+    },
+    "balanced": {
+        # Current recall-oriented defaults: ONVIF + deep pass + all ports,
+        # but the built-in curated wordlists and a bounded host budget.
+        "onvif": True,
+        "deep_auth": True,
+        "all_ports": True,
+        "any_status_live": True,
+        "retry_after_404": True,
+        "port_parallel": 8,
+        "port_pipeline_parallel": 8,
+        "deep_auth_routes": 40,
+        "host_timeout": 60.0,
+        "onvif_profiles": 4,
+        "mode": None,
+        "ports": None,
+        "use_big_wordlists": False,
+        "routes": DEFAULT_ROUTES,
+        "credentials": DEFAULT_CREDENTIALS,
+    },
+    "max": {
+        # Everything: community wordlists, common camera ports, CVE mode and a
+        # long per-host budget.  Deliberately the slowest profile.
+        "onvif": True,
+        "deep_auth": True,
+        "all_ports": True,
+        "any_status_live": True,
+        "retry_after_404": True,
+        "port_parallel": 16,
+        "port_pipeline_parallel": 16,
+        "deep_auth_routes": 64,
+        "host_timeout": 300.0,
+        "onvif_profiles": 8,
+        "mode": "combined",
+        "ports": COMMON_RTSP_PORTS,
+        "use_big_wordlists": True,
+        "routes": DEFAULT_ROUTES,
+        "credentials": DEFAULT_CREDENTIALS,
+    },
+}
+
+
+def _apply_profile(args) -> dict:
+    """Resolve --profile into concrete values, honouring explicit flags.
+
+    Returns a small dict with the values that are not stored on ``args`` (the
+    enabled ONVIF state and whether --host-timeout was explicit).
+    """
+    profile = PROFILES[args.profile]
+
+    host_timeout_explicit = args.host_timeout is not None
+    if args.host_timeout is None:
+        args.host_timeout = profile["host_timeout"]
+
+    if args.port_parallel is None:
+        args.port_parallel = profile["port_parallel"]
+    if args.port_pipeline_parallel is None:
+        args.port_pipeline_parallel = profile["port_pipeline_parallel"]
+    if args.deep_auth is None:
+        args.deep_auth = profile["deep_auth"]
+    if args.deep_auth_routes is None:
+        args.deep_auth_routes = profile["deep_auth_routes"]
+    if args.onvif_profiles == 4 and profile["onvif_profiles"] != 4:
+        args.onvif_profiles = profile["onvif_profiles"]
+
+    if args.onvif:
+        onvif_enabled = True
+    elif args.no_onvif:
+        onvif_enabled = False
+    else:
+        onvif_enabled = profile["onvif"]
+
+    # Wordlists: only replace the *default* path.  An explicit -r/-c always
+    # wins.  "max" prefers the community lists when they are available.
+    routes = args.routes
+    credentials = args.credentials
+    if routes == DEFAULT_ROUTES:
+        routes = profile["routes"]
+        if (
+            profile["use_big_wordlists"]
+            and profile["routes"] == DEFAULT_ROUTES
+            and _BIG_ROUTES.is_file()
+        ):
+            routes = _BIG_ROUTES
+    if credentials == DEFAULT_CREDENTIALS:
+        credentials = profile["credentials"]
+        if (
+            profile["use_big_wordlists"]
+            and profile["credentials"] == DEFAULT_CREDENTIALS
+            and _BIG_CREDENTIALS.is_file()
+        ):
+            credentials = _BIG_CREDENTIALS
+
+    if profile["ports"] is not None and not getattr(
+        args, "_ports_explicit", False
+    ):
+        args.ports = list(profile["ports"])
+    if profile["mode"] is not None and not getattr(
+        args, "_mode_explicit", False
+    ):
+        args.mode = profile["mode"]
+
+    args.routes = routes
+    args.credentials = credentials
+    return {
+        "onvif": onvif_enabled,
+        "host_timeout_explicit": host_timeout_explicit,
+    }
 
 
 def _c(text, code="36"):
@@ -294,6 +446,7 @@ def _install_stop_signals() -> None:
 
 def main():
     args = parser.parse_args()
+    profile_info = _apply_profile(args)
 
     if args.targets is None and args.gallery_html is None and args.capture is None:
         parser.error("the following arguments are required: -t/--targets")
@@ -558,7 +711,8 @@ def main():
         total = min(total, args.limit)
     print(
         _c(
-            f"[info] mode={args.mode} "
+            f"[info] profile={args.profile} mode={args.mode} "
+            f"onvif={'on' if profile_info['onvif'] else 'off'} "
             f"targets={describe_targets(args.targets)} "
             f"ips={total}/{n_targets} ports={ports} "
             f"routes={len(routes)} creds={len(credentials)}"
@@ -568,17 +722,23 @@ def main():
     # Long credential lists stall the tail: a slow-but-alive camera burns ~one
     # socket timeout per credential.  Cap each host with a wall-clock budget so
     # the run finishes promptly; an explicit --host-timeout overrides this.
-    if args.host_timeout == 0 and len(credentials) >= 100:
-        args.host_timeout = 30.0
-        print(_c("[info] auto host budget: 30s (override with --host-timeout)", "33"))
+    if (
+        not profile_info["host_timeout_explicit"]
+        and args.host_timeout == 0
+        and (
+            len(credentials) >= 100
+            or (args.deep_auth and len(credentials) > 20)
+        )
+    ):
+        # The deep pass multiplies a failed login by the stream-route list.
+        # Without a budget a single lockout-prone camera can occupy a slot for
+        # minutes.  The common credentials are all near the top of the list, so
+        # 60s is enough to find a normal device.
+        args.host_timeout = 60.0
+        print(_c("[info] auto host budget: 60s (override with --host-timeout)", "33"))
 
-    # ONVIF discovery is implied by the exploit-oriented modes (its whole point
-    # is to replace RTSP route guessing with the device's own answer) and can be
-    # enabled explicitly in 'brute' mode with --onvif, or turned off again with
-    # --no-onvif.
-    onvif_enabled = (
-        (args.onvif or args.mode in ("cve", "combined")) and not args.no_onvif
-    )
+    # Resolved by --profile unless --onvif / --no-onvif was given explicitly.
+    onvif_enabled = profile_info["onvif"]
 
     settings = Settings(
         ports=ports,
@@ -592,10 +752,17 @@ def main():
         screenshot_timeout=args.screenshot_timeout,
         max_attempts=args.max_attempts,
         max_transport_fails=args.max_transport_fails,
+        deep_auth=args.deep_auth,
+        deep_auth_routes=args.deep_auth_routes,
         attempts_per_sec=args.attempts_per_sec,
         host_timeout=args.host_timeout,
         failed_with_error=args.failed_with_error,
         route_parallel=args.route_parallel,
+        port_parallel=args.port_parallel,
+        port_pipeline_parallel=args.port_pipeline_parallel,
+        all_ports=PROFILES[args.profile]["all_ports"],
+        any_status_live=PROFILES[args.profile]["any_status_live"],
+        retry_after_404=PROFILES[args.profile]["retry_after_404"],
         mode=args.mode,
         cve_db=cve_db,
         http_ports=args.http_ports,
@@ -605,10 +772,11 @@ def main():
         onvif_ports=list(args.onvif_ports) if args.onvif_ports else [],
         onvif_timeout=args.onvif_timeout,
         onvif_profiles=max(1, args.onvif_profiles),
-        # The ONVIF module's own short default list is used unless the caller
-        # supplied credentials: the scanner's full wordlist is sized for RTSP
-        # bruting, and replaying thousands of it over SOAP would be pointless.
-        onvif_creds=list(credentials) if (credentials and args.onvif) else [],
+        # Reuse the user's credential list for ONVIF too; the ONVIF module
+        # de-duplicates it, always tries anonymous first and caps it at
+        # onvif.MAX_CREDS, so a huge RTSP wordlist cannot turn into thousands
+        # of SOAP round-trips.
+        onvif_creds=list(credentials) if (credentials and onvif_enabled) else [],
         rate_limit=args.rate_limit,
         https_ports=list(args.https_ports),
         expected_total=total,

@@ -824,3 +824,8 @@
 /live/ch04_1
 /live/2
 /live/3
+/Streaming/Channels/102/
+/sub/av_stream
+/stream0
+/onvif2
+/cam1/h264

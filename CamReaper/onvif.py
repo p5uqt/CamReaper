@@ -48,18 +48,25 @@ from CamReaper.cve import _http_request_full
 # Web ports that commonly serve the ONVIF device service.  Deliberately wider
 # than the CVE web-panel list: ONVIF lives on vendor-specific ports far more
 # often than the vulnerable panel does.
-ONVIF_PORTS = (80, 8000, 8080, 8899, 2020, 34567, 5000, 81, 8081, 9000, 8082)
+ONVIF_PORTS = (
+    80, 81, 8000, 8001, 8080, 8081, 8082, 8083, 8088,
+    8899, 8888, 2020, 34567, 5000, 9000,
+)
 
 # Candidate service endpoints, tried in order.  ``device_service`` is first
 # because most firmware serves the media actions there too; the rest cover
 # vendors that split device and media services.
 DEVICE_ENDPOINTS = (
     "/onvif/device_service",
+    "/onvif/device_service/",
     "/onvif/media_service",
+    "/onvif/media_service/",
     "/onvif/media",
     "/onvif/Media",
     "/onvif/services",
     "/onvif/device",
+    "/onvif/device/",
+    "/onvif/media2_service",
 )
 
 # Elements carry the ONVIF namespace, but firmware is inconsistent about
@@ -111,7 +118,7 @@ MAX_PROFILES = 4
 # Cap on credentials tried per port.  Every credential costs several SOAP
 # round-trips per endpoint, so an unbounded list would make a single hostile or
 # slow host dominate the scan's wall-clock time.
-MAX_CREDS = 12
+MAX_CREDS = 64
 
 
 @dataclass
@@ -333,7 +340,9 @@ def _extract_profiles(body: str) -> list:
     """
     seen = []
     for match in _TOKEN_RE.finditer(body.encode("utf-8", errors="replace")):
-        token = match.group(2).decode("utf-8", errors="replace").strip()
+        token = saxutils.unescape(
+            match.group(2).decode("utf-8", errors="replace")
+        ).strip()
         if token and token not in seen:
             seen.append(token)
     return seen
@@ -343,7 +352,11 @@ def _extract_uri(body: str) -> str:
     match = _URI_RE.search(body.encode("utf-8", errors="replace"))
     if not match:
         return ""
-    return match.group(1).decode("utf-8", errors="replace").strip()
+    # The URL is XML text: firmware commonly escapes query separators as
+    # "&amp;", and using that verbatim produces a URL the camera rejects.
+    return saxutils.unescape(
+        match.group(1).decode("utf-8", errors="replace")
+    ).strip()
 
 
 def _soap_fault(body: str) -> str:
@@ -376,19 +389,24 @@ async def _soap_post(ip, port, path, action, payload, timeout, extra=None):
     headers = _action_headers(action)
     if extra:
         headers.extend(extra)
-    status, _server, body, resp_headers = await _http_request_full(
+    status, server, body, resp_headers = await _http_request_full(
         ip, port, path, method="POST",
         content_type='text/xml; charset="utf-8"',
         content=_envelope(payload).decode("utf-8"),
         timeout=timeout, headers=headers,
     )
+    if server:
+        resp_headers.setdefault("server", server)
     return status, body, resp_headers
 
 
 async def _try_endpoint(ip, port, path, action, payload, timeout, cred) -> tuple:
     """One SOAP round-trip, walking the authentication strategies in order.
 
-    Returns ``(body, resp_headers)``; ``body`` is "" when the device refused.
+    Returns ``(body, resp_headers, endpoint_ok)``.  ``body`` is "" when the
+    device refused; ``endpoint_ok`` means the endpoint itself exists (it
+    answered with a challenge or a SOAP fault), so trying the other candidate
+    paths for the same rejected credential would only waste requests.
     """
     user = password = ""
     if cred and ":" in cred:
@@ -396,19 +414,25 @@ async def _try_endpoint(ip, port, path, action, payload, timeout, cred) -> tuple
     elif cred:
         user, password = cred, ""
 
+    def _recognised(status, body):
+        if status in ("401", "403"):
+            return True
+        return status == "200" and bool(body) and bool(_soap_fault(body))
+
     # Anonymous first - a notable share of devices need no credentials for
     # GetProfiles, and it costs a single request.
     if not cred:
         status, body, hdrs = await _soap_post(ip, port, path, action, payload, timeout)
         if status == "200" and body and not _soap_fault(body):
-            return body, hdrs
-        return "", hdrs
+            return body, hdrs, True
+        return "", hdrs, _recognised(status, body)
 
     # A device that answers with a Digest challenge has told us exactly which
     # scheme it wants, and the WS-Security/Basic attempts before it are pure
     # waste - so the challenge is captured from the first response and reused
     # for the digest attempt at the end of the list.
     challenge = ""
+    endpoint_ok = False
 
     def _ok(status, body):
         return status == "200" and bool(body) and not _soap_fault(body)
@@ -422,7 +446,8 @@ async def _try_endpoint(ip, port, path, action, payload, timeout, cred) -> tuple
         )
         challenge = challenge or hdrs.get("www-authenticate", "")
         if _ok(status, body):
-            return body, hdrs
+            return body, hdrs, True
+        endpoint_ok = endpoint_ok or _recognised(status, body)
 
     # HTTP Basic.
     status, body, hdrs = await _soap_post(
@@ -431,7 +456,8 @@ async def _try_endpoint(ip, port, path, action, payload, timeout, cred) -> tuple
     )
     challenge = challenge or hdrs.get("www-authenticate", "")
     if _ok(status, body):
-        return body, hdrs
+        return body, hdrs, True
+    endpoint_ok = endpoint_ok or _recognised(status, body)
 
     # HTTP Digest, using the challenge captured above.
     if "digest" in challenge.lower():
@@ -442,8 +468,9 @@ async def _try_endpoint(ip, port, path, action, payload, timeout, cred) -> tuple
             extra=[("Authorization", auth)],
         )
         if _ok(status, body):
-            return body, hdrs
-    return "", hdrs
+            return body, hdrs, True
+        endpoint_ok = endpoint_ok or _recognised(status, body)
+    return "", hdrs, endpoint_ok
 
 
 async def _soap_post_security(ip, port, path, action, payload, timeout, security):
@@ -458,24 +485,56 @@ async def _soap_post_security(ip, port, path, action, payload, timeout, security
     return status, body, resp_headers
 
 
-def _looks_onvif(status: str, body: str) -> bool:
+_CAMERA_SERVER_NEEDLES = (
+    "onvif",
+    "ipcam",
+    "ip camera",
+    "ip-camera",
+    "camera",
+    "dahua",
+    "hikvision",
+    "axis",
+    "bosch",
+    "sony",
+    "tvt",
+    "uniview",
+    "xmeye",
+    "xiongmai",
+    "amcrest",
+    "instar",
+    "v380",
+    "netwave",
+    "avtech",
+    "zosi",
+    "ptzoptics",
+)
+
+
+def _looks_onvif(status: str, body: str, headers: dict = None) -> bool:
     """Cheap "is this port an ONVIF device service?" test.
 
-    A scanner probes a dozen ports per host and the overwhelming majority of
-    them are either refused outright or an ordinary web panel.  Walking the full
+    A scanner probes a dozen ports per host and the overwhelming majority are
+    either refused outright or an ordinary web panel.  Walking the full
     endpoint x credential matrix against those would cost dozens of requests
-    each, so the port is gated first with a single anonymous ``GetProfiles``.
+    each, so the port is gated with one anonymous ``GetProfiles``.
 
-    Anything that answers with a SOAP envelope, an ONVIF namespace, or an
-    ``Unauthorized`` challenge passes; a ``404``/empty answer from a plain web
-    server does not.
+    A bare 401 is *not* enough: plenty of unrelated web panels challenge with
+    Basic auth, and the old gate then burned the whole credential/endpoint
+    matrix on them.  A 401 only passes when the server header or digest realm
+    identifies an ONVIF/camera service; otherwise the caller does one
+    confirming ``GetSystemDateAndTime`` probe.
     """
+    if body:
+        low = body[:4096].lower()
+        if "envelope" in low or "onvif" in low:
+            return True
     if status == "401":
-        return True
-    if not body:
-        return False
-    low = body[:4096].lower()
-    return "envelope" in low or "onvif" in low
+        headers = headers or {}
+        text = (
+            headers.get("server", "") + " " + headers.get("www-authenticate", "")
+        ).lower()
+        return any(needle in text for needle in _CAMERA_SERVER_NEEDLES)
+    return False
 
 
 async def _probe_port(ip, port, timeout, creds, max_profiles) -> OnvifResult:
@@ -489,23 +548,52 @@ async def _probe_port(ip, port, timeout, creds, max_profiles) -> OnvifResult:
     action_profiles = "http://www.onvif.org/ver10/media/wsdl/GetProfiles"
 
     try:
-        status, body, _hdrs = await _soap_post(
+        status, body, headers = await _soap_post(
             ip, port, DEVICE_ENDPOINTS[0], action_profiles, payload, timeout,
         )
     except Exception:
         return result
-    if not _looks_onvif(status, body):
-        return result
+    if not _looks_onvif(status, body, headers):
+        if status != "401":
+            return result
+        # A generic 401 panel is indistinguishable from an anonymous ONVIF
+        # device at this point.  GetSystemDateAndTime is unauthenticated on
+        # compliant devices, so one extra request decides it.
+        try:
+            status, body, headers = await _soap_post(
+                ip, port, DEVICE_ENDPOINTS[0],
+                "http://www.onvif.org/ver10/device/wsdl/GetSystemDateAndTime",
+                b"<tds:GetSystemDateAndTime/>", timeout,
+            )
+        except Exception:
+            return result
+        if not _looks_onvif(status, body, headers):
+            return result
+
+    # A false-positive port (a generic 401 web panel that happened to look like
+    # ONVIF) must not burn the full credential x endpoint matrix at one socket
+    # timeout per request.  Cap the whole port at a few timeouts.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(10.0, timeout * 4.0)
 
     for cred in creds:
+        if loop.time() >= deadline:
+            break
         for path in DEVICE_ENDPOINTS:
+            if loop.time() >= deadline:
+                break
             try:
-                body, _hdrs = await _try_endpoint(
+                body, _hdrs, endpoint_ok = await _try_endpoint(
                     ip, port, path, action_profiles, payload, timeout, cred,
                 )
             except Exception:
                 continue
             if not body:
+                if endpoint_ok:
+                    # The path exists and rejected this credential; the other
+                    # candidate paths share the same auth, so stop wasting
+                    # round-trips on them and move on to the next password.
+                    break
                 continue
             tokens = _extract_profiles(body)
             if not tokens:
@@ -526,7 +614,7 @@ async def _resolve_tokens(ip, port, path, tokens, timeout, cred) -> list:
     streams = []
     for token in tokens:
         try:
-            body, _hdrs = await _try_endpoint(
+            body, _hdrs, _endpoint_ok = await _try_endpoint(
                 ip, port, path,
                 "http://www.onvif.org/ver10/media/wsdl/GetStreamUri",
                 _get_stream_uri_body(token),
@@ -569,21 +657,30 @@ async def discover(
     timeout: float = 5.0,
     creds=None,
     max_profiles: int = MAX_PROFILES,
+    first_only: bool = True,
 ) -> OnvifResult:
     """Probe ``ip`` for an ONVIF device service and return its stream URIs.
 
     Ports are tried concurrently: the common ones (80/8080) usually answer or
-    refuse instantly, and a wrong port costs one full timeout.  The first port
-    that yields a stream short-circuits the rest.
+    refuse instantly, and a wrong port costs one full timeout.  With
+    ``first_only`` the first port that yields a stream short-circuits the rest.
 
-    ``creds`` defaults to :data:`DEFAULT_ONVIF_CREDS`; pass an empty list to
-    only try the anonymous request.  The list is truncated to
-    :data:`MAX_CREDS` and de-duplicated: each credential costs several SOAP
-    round-trips, so an unbounded list would turn a single host into minutes of
-    wall-clock time.
+    ``first_only=False`` keeps every responding port: a test server or a
+    multi-camera box can expose several independent ONVIF services on different
+    ports of one address, and stopping at the first one reported a single
+    device.
+
+    ``creds`` defaults to :data:`DEFAULT_ONVIF_CREDS`; an empty list still
+    tries the anonymous request.  The list is truncated to :data:`MAX_CREDS`
+    and de-duplicated: each credential costs several SOAP round-trips, so an
+    unbounded list would turn a single host into minutes of wall-clock time.
     """
     port_list = list(ports) if ports else list(ONVIF_PORTS)
-    cred_list = list(creds) if creds is not None else [""] + list(DEFAULT_ONVIF_CREDS)
+    # Anonymous access is always worth one request: a fair number of devices
+    # expose GetProfiles without credentials, and a device that ignores auth
+    # headers can otherwise be rejected by an unexpected Authorization one.
+    base = list(creds) if creds is not None else list(DEFAULT_ONVIF_CREDS)
+    cred_list = [""] + base
     # De-duplicate while keeping the caller's ordering, then bound the cost.
     seen = set()
     trimmed = []
@@ -600,6 +697,27 @@ async def discover(
             return OnvifResult(port=port)
 
     tasks = [asyncio.create_task(_one(p)) for p in port_list]
+    if not first_only:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        streams = []
+        endpoint = ""
+        port = 0
+        credentials = ""
+        for res in results:
+            if isinstance(res, BaseException) or not res.streams:
+                continue
+            if not streams:
+                endpoint, port, credentials = (
+                    res.endpoint, res.port, res.credentials
+                )
+            streams.extend(res.streams)
+        return OnvifResult(
+            streams=streams,
+            endpoint=endpoint,
+            port=port,
+            credentials=credentials,
+        )
+
     try:
         for coro in asyncio.as_completed(tasks):
             res = await coro

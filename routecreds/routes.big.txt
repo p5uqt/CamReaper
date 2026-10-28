@@ -324,3 +324,10 @@
 /ONVIF/channels/4
 /ONVIF/channels/5
 /ONVIF/channels/6
+/Streaming/Channels/101
+/Streaming/Channels/102/
+/stream0
+/videoSub
+/onvif2
+/s1
+/profile1

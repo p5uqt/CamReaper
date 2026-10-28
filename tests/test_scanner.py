@@ -20,8 +20,9 @@ async def _scan(server, creds, routes=("/", "/stream1"), **kw):
     async def targets():
         yield server.host
 
+    ports = kw.pop("ports", [server.port])
     settings = Settings(
-        ports=[server.port],
+        ports=ports,
         routes=routes,
         credentials=creds,
         timeout=1.0,
@@ -83,6 +84,43 @@ async def test_auth_host_with_valid_cred(report_paths):
         stats = await _scan(srv, creds=["admin:admin"])
         assert stats["found"] == 1
         assert "admin:admin@127.0.0.1" in report_paths.read_text()
+    finally:
+        await srv.stop()
+
+
+async def test_basic_auth_camera_is_opened(report_paths):
+    """A Basic-only panel must accept the password.
+
+    Regression: any realm used to be treated as a Digest challenge, so the
+    scanner sent a Digest header with an empty nonce to every Basic camera and
+    no password could ever work.
+    """
+    from tests.mock_rtsp import make_server
+
+    srv = await make_server("basic-auth", valid_cred="admin:secret")
+    try:
+        stats = await _scan(
+            srv, creds=["wrong:wrong", "admin:secret"], routes=["/"]
+        )
+        assert stats["found"] == 1
+        assert "admin:secret@" in report_paths.read_text()
+    finally:
+        await srv.stop()
+
+
+async def test_404_on_dummy_route_still_sweeps_for_open_stream(report_paths):
+    """A camera may answer an unknown path with 404 rather than a 401.
+
+    That is still a live RTSP server, and the old pipeline classified it as
+    "unconfirmed" and dropped it before the route sweep could find "/".
+    """
+    from tests.mock_rtsp import make_server
+
+    srv = await make_server("root-only")
+    try:
+        stats = await _scan(srv, creds=[], routes=["/"])
+        assert stats["found"] == 1
+        assert f":{srv.port}/" in report_paths.read_text()
     finally:
         await srv.stop()
 
@@ -704,6 +742,37 @@ async def test_open_port_found_among_several(report_paths):
         await open_srv.stop()
 
 
+async def test_every_live_port_of_one_host_is_scanned(report_paths):
+    """A server can expose several cameras on different ports of one IP.  The
+    old pipeline stopped at the first responsive port and reported one."""
+    from tests.mock_rtsp import make_server
+
+    first = await make_server("open")
+    second = await make_server("scanner", valid_cred="admin:admin")
+    try:
+        async def targets():
+            yield first.host
+
+        settings = Settings(
+            ports=[first.port, second.port],
+            routes=["/"],
+            credentials=["admin:admin"],
+            timeout=1.0,
+            host_concurrency=1,
+            screenshot_concurrency=1,
+            enable_screenshots=False,
+        )
+        stats = await run(targets(), settings)
+        assert stats["found"] == 2
+        text = report_paths.read_text()
+        assert f":{first.port}/" in text
+        assert f":{second.port}/" in text
+        assert stats["ports"] == {str(first.port): 1, str(second.port): 1}
+    finally:
+        await first.stop()
+        await second.stop()
+
+
 async def test_first_responsive_port_wins_regardless_of_order(report_paths):
     """An auth-port earlier in the list is the host's port of record, even when
     a later port is open - the port order is the user's explicit choice."""
@@ -808,6 +877,59 @@ async def test_open_route_survives_closed_routes_serial(report_paths):
         await srv.stop()
 
 
+async def test_404_for_wrong_password_does_not_stop_the_credential_loop(report_paths):
+    """A camera that answers 404 (not 401) to a rejected login must still try
+    the next credential instead of concluding the first one was valid."""
+    from tests.mock_rtsp import make_server
+
+    srv = await make_server("404-auth", valid_cred="admin:secret")
+    try:
+        stats = await _scan(
+            srv, creds=["wrong:wrong", "admin:secret"], routes=["/"]
+        )
+        assert stats["found"] == 1
+        assert "admin:secret@" in report_paths.read_text()
+    finally:
+        await srv.stop()
+
+
+async def test_deep_auth_finds_password_on_a_named_route(report_paths):
+    """A camera can answer 401 on "/" even for the *correct* password and only
+    open its real stream path.  The second pass must try the credentials on
+    those routes instead of concluding "no auth worked"."""
+    from tests.mock_rtsp import make_server
+
+    srv = await make_server(
+        "named-route-auth", open_route="/stream1", close_on_unknown=False
+    )
+    try:
+        stats = await _scan(
+            srv, creds=["admin:admin"], routes=("/", "/stream1")
+        )
+        assert stats["found"] == 1
+        assert "/stream1" in report_paths.read_text()
+    finally:
+        await srv.stop()
+
+
+async def test_deep_auth_can_be_disabled(report_paths):
+    from tests.mock_rtsp import make_server
+
+    srv = await make_server(
+        "named-route-auth", open_route="/stream1", close_on_unknown=False
+    )
+    try:
+        stats = await _scan(
+            srv,
+            creds=["admin:admin"],
+            routes=("/", "/stream1"),
+            deep_auth=False,
+        )
+        assert stats["found"] == 0
+    finally:
+        await srv.stop()
+
+
 async def test_credentials_survive_a_camera_that_hangs_up(report_paths):
     """A camera that drops the socket after every request must still be opened
     by a later credential in the list - bailing out on the first hang-up used to
@@ -887,6 +1009,80 @@ async def test_onvif_stage_finds_stream_the_route_sweep_missed(report_paths):
         await rtsp.stop()
 
 
+async def test_onvif_runs_even_when_no_rtsp_port_is_open(report_paths):
+    """ONVIF lives on an HTTP port and must be asked even when every RTSP port
+    in -p is closed.  The old pipeline returned before the ONVIF stage in that
+    case, so an ONVIF-only device was invisible."""
+    import socket
+
+    from tests.mock_rtsp import make_server as rtsp_server
+    from tests.mock_onvif import make_server as onvif_server
+
+    rtsp = await rtsp_server(
+        "named-route-auth", valid_cred="admin:admin",
+        open_route="/Streaming/Channels/MainStream",
+    )
+    onvif = await onvif_server(auth=None, rtsp_port=rtsp.port)
+    # Find an unused local port: the RTSP scan must not reach the camera there.
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    closed_port = sock.getsockname()[1]
+    sock.close()
+    try:
+        stats = await _scan(
+            rtsp, [], routes=["/"], onvif=True,
+            onvif_ports=[onvif.port], onvif_timeout=2.0,
+            onvif_creds=[""], ports=[closed_port],
+        )
+        assert stats["found"] == 1
+        assert stats.get("onvif_found") == 1
+        assert "/Streaming/Channels/MainStream" in report_paths.read_text()
+    finally:
+        await onvif.stop()
+        await rtsp.stop()
+
+
+async def test_onvif_finds_devices_on_several_ports(report_paths):
+    """A test server can host independent ONVIF services on several ports of
+    one address.  Discovery must not stop at the first responding port."""
+    import socket
+
+    from tests.mock_rtsp import make_server as rtsp_server
+    from tests.mock_onvif import make_server as onvif_server
+
+    first_rtsp = await rtsp_server(
+        "named-route-auth", valid_cred="admin:admin",
+        open_route="/Streaming/Channels/MainStream",
+    )
+    second_rtsp = await rtsp_server(
+        "named-route-auth", valid_cred="admin:admin",
+        open_route="/Streaming/Channels/MainStream",
+    )
+    first_onvif = await onvif_server(auth=None, rtsp_port=first_rtsp.port)
+    second_onvif = await onvif_server(auth=None, rtsp_port=second_rtsp.port)
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    closed_port = sock.getsockname()[1]
+    sock.close()
+    try:
+        stats = await _scan(
+            first_rtsp, [], routes=["/"], onvif=True,
+            onvif_ports=[first_onvif.port, second_onvif.port],
+            onvif_timeout=2.0, onvif_creds=[""],
+            ports=[closed_port],
+        )
+        assert stats["found"] == 2
+        assert stats.get("onvif_found") == 2
+        assert stats["ports"] == {
+            str(first_rtsp.port): 1, str(second_rtsp.port): 1
+        }
+    finally:
+        await second_onvif.stop()
+        await first_onvif.stop()
+        await second_rtsp.stop()
+        await first_rtsp.stop()
+
+
 async def test_onvif_stage_requires_rtsp_verification(report_paths):
     """A GetStreamUri answer is not proof the stream plays - a profile can be
     disabled. The stage must confirm it over RTSP before reporting it."""
@@ -928,3 +1124,67 @@ async def test_onvif_stage_disabled_by_default(report_paths):
     finally:
         await onvif.stop()
         await rtsp.stop()
+
+
+# --- fast profile compatibility ---------------------------------------------
+
+
+async def test_fast_profile_processes_only_the_first_responsive_port(report_paths):
+    """--profile fast keeps the old "first responsive port wins" rule."""
+    from tests.mock_rtsp import make_server
+
+    first = await make_server("open")
+    second = await make_server("scanner", valid_cred="admin:admin")
+    try:
+        async def targets():
+            yield first.host
+
+        settings = Settings(
+            ports=[first.port, second.port],
+            routes=["/"],
+            credentials=["admin:admin"],
+            timeout=1.0,
+            host_concurrency=1,
+            screenshot_concurrency=1,
+            enable_screenshots=False,
+            all_ports=False,
+        )
+        stats = await run(targets(), settings)
+        assert stats["found"] == 1
+        text = report_paths.read_text()
+        assert f":{first.port}/" in text
+        assert f":{second.port}/" not in text
+    finally:
+        await second.stop()
+        await first.stop()
+
+
+async def test_fast_profile_drops_a_camera_that_404s_the_dummy_route(report_paths):
+    """The old scanner classified a 404 dummy as unconfirmed and dropped it."""
+    from tests.mock_rtsp import make_server
+
+    srv = await make_server("root-only")
+    try:
+        stats = await _scan(
+            srv, creds=[], routes=["/"], any_status_live=False
+        )
+        assert stats["found"] == 0
+    finally:
+        await srv.stop()
+
+
+async def test_fast_profile_stops_at_a_404_credential(report_paths):
+    """The old 404 shortcut stopped after the first credential; fast keeps it."""
+    from tests.mock_rtsp import make_server
+
+    srv = await make_server("404-auth", valid_cred="admin:secret")
+    try:
+        stats = await _scan(
+            srv,
+            creds=["wrong:wrong", "admin:secret"],
+            routes=["/"],
+            retry_after_404=False,
+        )
+        assert stats["found"] == 0
+    finally:
+        await srv.stop()

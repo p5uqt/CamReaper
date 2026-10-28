@@ -93,3 +93,28 @@ def test_wordlist_lines_are_usable_routes(path):
             f"{path.name}: {route!r} contains whitespace"
         )
         assert route.isascii(), f"{path.name}: {route!r} is not ASCII"
+
+
+# The fast profile deliberately uses the original small lists.  Keep them
+# well-formed and small: this is the "same speed as before" path.
+FAST_ROUTES_FILE = ROOT / "CamReaper" / "defroutes.fast"
+FAST_CREDS_FILE = ROOT / "CamReaper" / "defcreds.fast"
+
+
+def test_fast_wordlists_are_the_original_small_lists():
+    assert len(_load(FAST_ROUTES_FILE)) == 11
+    assert len(_load(FAST_CREDS_FILE)) == 11
+
+
+def test_fast_routes_are_usable_paths():
+    for route in _load(FAST_ROUTES_FILE):
+        assert route.startswith("/")
+        assert not any(c.isspace() for c in route)
+        assert route.isascii()
+
+
+def test_fast_credentials_are_well_formed():
+    for cred in _load(FAST_CREDS_FILE):
+        assert ":" in cred
+        assert not any(c.isspace() for c in cred)
+        assert cred.isascii()

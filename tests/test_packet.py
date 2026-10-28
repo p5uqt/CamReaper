@@ -55,6 +55,37 @@ def test_digest_auth_packet():
     )
 
 
+def test_basic_scheme_is_used_even_when_a_realm_is_known():
+    """A Basic challenge also carries a realm.  It must not turn into Digest."""
+    text = packet.describe(
+        "0.0.0.0", 554, "/", 1, "admin:admin",
+        realm="Cam", nonce="", scheme="basic",
+    )
+    assert BASIC in text
+    assert "Digest" not in text
+
+
+def test_digest_qop_and_opaque_fields():
+    import hashlib
+
+    text = packet.describe(
+        "1.2.3.4", 554, "/live", 1, "admin:secret",
+        realm="r", nonce="n", scheme="digest",
+        opaque="op", qop="auth", nc=1, cnonce="cn",
+    )
+    assert "qop=auth" in text
+    assert "nc=00000001" in text
+    assert 'cnonce="cn"' in text
+    assert 'opaque="op"' in text
+    # Verify the RFC 2617 response actually uses qop.
+    ha1 = hashlib.md5(b"admin:r:secret").hexdigest()
+    ha2 = hashlib.md5(b"DESCRIBE:rtsp://1.2.3.4:554/live").hexdigest()
+    response = hashlib.md5(
+        f"{ha1}:n:00000001:cn:auth:{ha2}".encode()
+    ).hexdigest()
+    assert f'response="{response}"' in text
+
+
 def test_credential_with_extra_colon_in_password():
     packet._ha1.cache_clear()
     packet.describe("1.2.3.4", 554, "/", 1, "admin:pa:ss", "realm", "nonce")

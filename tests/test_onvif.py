@@ -70,6 +70,13 @@ def test_extract_profiles_accepts_single_quoted_attributes():
     assert _extract_profiles(xml) == ["ch1"]
 
 
+def test_extract_uri_unescapes_xml_entities():
+    body = "<tt:Uri>rtsp://cam/Streaming/Channels/101?x=1&amp;y=2</tt:Uri>"
+    assert _extract_uri(body) == (
+        "rtsp://cam/Streaming/Channels/101?x=1&y=2"
+    )
+
+
 def test_extract_uri_from_stream_setup():
     body = (
         "<trt:GetStreamUriResponse><trt:MediaUri>"

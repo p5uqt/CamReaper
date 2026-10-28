@@ -242,17 +242,40 @@ class MockRTSPServer:
                     return
             else:
                 await self._send(writer, "401")
+        elif self.mode == "basic-auth":
+            if creds_ok:
+                await self._send(writer, "200", body="v=0\r\n")
+            else:
+                await self._send(writer, "401", challenge="Basic")
+        elif self.mode == "404-auth":
+            # Some firmware answers a rejected login with 404, not 401.  The
+            # scanner must not mistake that for "credentials are valid".
+            if creds_ok:
+                await self._send(writer, "200", body="v=0\r\n")
+            else:
+                await self._send(writer, "404", body="Not Found\r\n")
+        elif self.mode == "root-only":
+            # A server that answers an unknown path with 404 (not a 401
+            # challenge) and serves "/" without credentials.
+            if self._extract_route(text) == "/":
+                await self._send(writer, "200", body="v=0\r\n")
+            else:
+                await self._send(writer, "404", body="Not Found\r\n")
         elif self.mode in ("digest-auth", "scanner"):
             if creds_ok:
                 await self._send(writer, "200", body="v=0\r\n")
             else:
                 await self._send(writer, "401")
 
-    async def _send(self, writer, code, body=""):
+    async def _send(self, writer, code, body="", challenge="Digest"):
+        if challenge == "Basic":
+            www_auth = 'WWW-Authenticate: Basic realm="Cam"\r\n'
+        else:
+            www_auth = 'WWW-Authenticate: Digest realm="r", nonce="n1"\r\n'
         resp = (
             _status_line(code)
             + f"Server: {self.server_header}\r\n"
-            + 'WWW-Authenticate: Digest realm="r", nonce="n1"\r\n'
+            + www_auth
             + f"Content-Length: {len(body)}\r\n"
             + "\r\n"
             + f"{body}"

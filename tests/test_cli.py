@@ -291,3 +291,165 @@ def test_terminal_width_is_clamped_to_a_readable_range():
     with mock.patch("shutil.get_terminal_size",
                     return_value=mock.Mock(columns=500)):
         assert _terminal_width() <= 100
+
+
+# --- scan profiles -----------------------------------------------------------
+
+
+def _targets_file(tmp_path):
+    f = tmp_path / "targets.txt"
+    f.write_text("127.0.0.1\n")
+    return f
+
+
+def test_profile_defaults_to_fast():
+    args = parser.parse_args([])
+    assert args.profile == "fast"
+    # Profile-sensitive flags are unresolved until _apply_profile().
+    assert args.deep_auth is None
+    assert args.deep_auth_routes is None
+    assert args.host_timeout is None
+    assert args.port_parallel is None
+    assert args.port_pipeline_parallel is None
+
+
+def test_apply_profile_fast_restores_pre_profile_defaults(tmp_path):
+    from CamReaper import FAST_CREDENTIALS, FAST_ROUTES
+    from CamReaper.__main__ import _apply_profile
+
+    target = _targets_file(tmp_path)
+    args = parser.parse_args(["-t", str(target), "--profile", "fast"])
+    info = _apply_profile(args)
+
+    assert args.routes == FAST_ROUTES
+    assert args.credentials == FAST_CREDENTIALS
+    assert args.deep_auth is False
+    assert args.host_timeout == 0.0
+    assert args.port_parallel == 4
+    assert args.port_pipeline_parallel == 1
+    assert args.deep_auth_routes == 40
+    assert info["onvif"] is False
+    from CamReaper.__main__ import PROFILES
+    assert PROFILES["fast"]["all_ports"] is False
+    assert PROFILES["fast"]["any_status_live"] is False
+    assert PROFILES["fast"]["retry_after_404"] is False
+
+
+def test_apply_profile_max_uses_big_lists_ports_and_combined(tmp_path):
+    from CamReaper.__main__ import (
+        COMMON_RTSP_PORTS,
+        _BIG_CREDENTIALS,
+        _BIG_ROUTES,
+        _apply_profile,
+    )
+
+    target = _targets_file(tmp_path)
+    args = parser.parse_args(["-t", str(target), "--profile", "max"])
+    info = _apply_profile(args)
+
+    assert args.routes == (_BIG_ROUTES if _BIG_ROUTES.is_file() else args.routes)
+    assert args.credentials == (
+        _BIG_CREDENTIALS if _BIG_CREDENTIALS.is_file() else args.credentials
+    )
+    assert args.mode == "combined"
+    assert args.ports == COMMON_RTSP_PORTS
+    assert args.host_timeout == 300.0
+    assert args.port_parallel == 16
+    assert args.port_pipeline_parallel == 16
+    assert args.deep_auth_routes == 64
+    assert args.onvif_profiles == 8
+    assert info["onvif"] is True
+
+
+def test_apply_profile_keeps_explicit_flags(tmp_path):
+    from CamReaper.__main__ import _apply_profile
+
+    target = _targets_file(tmp_path)
+    routes = tmp_path / "routes.txt"
+    routes.write_text("/stream1\n")
+    creds = tmp_path / "creds.txt"
+    creds.write_text("admin:admin\n")
+    args = parser.parse_args(
+        [
+            "-t", str(target),
+            "--profile", "balanced",
+            "-r", str(routes),
+            "-c", str(creds),
+            "--no-onvif",
+            "--host-timeout", "0",
+            "--port-parallel", "12",
+            "--port-pipeline-parallel", "3",
+            "--deep-auth-routes", "7",
+            "--no-deep-auth",
+        ]
+    )
+    info = _apply_profile(args)
+    assert args.routes == routes
+    assert args.credentials == creds
+    assert info["onvif"] is False
+    assert args.host_timeout == 0.0
+    assert info["host_timeout_explicit"] is True
+    assert args.port_parallel == 12
+    assert args.port_pipeline_parallel == 3
+    assert args.deep_auth_routes == 7
+    assert args.deep_auth is False
+
+
+def test_max_profile_does_not_override_explicit_ports(tmp_path):
+    from CamReaper.__main__ import _apply_profile
+
+    target = _targets_file(tmp_path)
+    args = parser.parse_args(
+        ["-t", str(target), "--profile", "max", "-p", "554"]
+    )
+    _apply_profile(args)
+    assert args.ports == [554]
+
+
+def test_max_profile_does_not_override_explicit_mode(tmp_path):
+    from CamReaper.__main__ import _apply_profile
+
+    target = _targets_file(tmp_path)
+    args = parser.parse_args(
+        ["-t", str(target), "--profile", "max", "--mode", "brute"]
+    )
+    _apply_profile(args)
+    assert args.mode == "brute"
+
+
+def test_main_wires_fast_profile_into_settings(monkeypatch, tmp_path):
+    """The profile must reach Settings, not just the argparse namespace."""
+    from CamReaper import __main__ as entry
+
+    captured = {}
+
+    async def fake_run(iter_targets, settings, on_counter=None, on_status=None):
+        captured["settings"] = settings
+        async for _ip in iter_targets:
+            pass
+        return {
+            "checked": 1, "found": 0, "screenshots": 0,
+            "found_no_frame": 0, "vendors": {}, "ports": {},
+            "cve_found": 0, "cve_tested": 0, "onvif_found": 0,
+            "http_checked": 0, "http_found": 0, "errors": 0,
+            "error_samples": [],
+        }
+
+    monkeypatch.setattr(entry, "run", fake_run)
+    target = _targets_file(tmp_path)
+    _run_main(
+        monkeypatch, tmp_path,
+        ["-t", str(target), "-p", "1", "--profile", "fast",
+         "--no-screenshots", "-T", "0.2"],
+    )
+    settings = captured["settings"]
+    assert settings.onvif is False
+    assert settings.deep_auth is False
+    assert settings.all_ports is False
+    assert settings.any_status_live is False
+    assert settings.retry_after_404 is False
+    assert settings.port_parallel == 4
+    assert settings.port_pipeline_parallel == 1
+    assert settings.host_timeout == 0.0
+    assert len(settings.routes) == 11
+    assert len(settings.credentials) == 11
