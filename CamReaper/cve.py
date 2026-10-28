@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from CamReaper import ratelimit
 from CamReaper.report import record_cve_test
 from CamReaper.rtsp import RTSPClient
 from CamReaper.scanner import probe_first_open_route, try_auth
@@ -26,7 +27,8 @@ from CamReaper.scanner import probe_first_open_route, try_auth
 DB_PATH = Path(__file__).parent / "cve_db.json"
 
 # Ports that serve HTTPS by convention (web panels rarely use the RTSP ones).
-_HTTPS_PORTS = (443, 8443)
+# ``configure_https_ports`` can extend this for non-standard TLS panels.
+_HTTPS_PORTS = {443, 8443}
 # Cap on a probe response: a camera panel is never bigger than this, and an
 # unbounded read would let a hostile host eat the scanner's memory.
 _MAX_BODY = 256 * 1024
@@ -98,18 +100,22 @@ class CVEDatabase:
                 self.skipped += 1
                 continue
             try:
+                credentials = item.get("credentials", []) or []
+                patterns = item.get("success_patterns", []) or []
+                if not isinstance(credentials, list) or not isinstance(patterns, list):
+                    raise TypeError("credentials/success_patterns must be lists")
                 entry = CVEEntry(
                     id=item["id"],
                     vendor=item["vendor"],
                     type=item["type"],
                     description=item.get("description", ""),
                     severity=item.get("severity", "medium"),
-                    credentials=item.get("credentials", []),
+                    credentials=[str(c) for c in credentials],
                     url_path=item.get("url_path", ""),
                     method=item.get("method", "GET"),
                     content_type=item.get("content_type", ""),
                     content=item.get("content", ""),
-                    success_patterns=item.get("success_patterns", []),
+                    success_patterns=[str(p) for p in patterns],
                 )
             except (KeyError, TypeError, AttributeError):
                 self.skipped += 1
@@ -133,6 +139,12 @@ class CVEDatabase:
 def _is_https(port: int) -> bool:
     """True when ``port`` is probed over TLS."""
     return port in _HTTPS_PORTS
+
+
+def configure_https_ports(ports) -> None:
+    """Set the ports probed with TLS (``--https-ports``)."""
+    global _HTTPS_PORTS
+    _HTTPS_PORTS = set(int(p) for p in (ports or ())) or {443, 8443}
 
 
 def _host_header(ip: str, port: int) -> str:
@@ -194,6 +206,9 @@ async def _http_request_full(
     writer = None
     try:
         ssl_ctx = _SSL_CONTEXT if _is_https(port) else None
+        # A CVE probe is one new connection: pace it with the same global
+        # budget the RTSP stage uses.
+        await ratelimit.acquire()
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(ip, port, ssl=ssl_ctx), timeout=timeout
         )
@@ -249,7 +264,7 @@ async def _http_request_full(
 
         body = rest
         if chunked:
-            body = await _read_chunked(reader, timeout, len(body))
+            body = await _read_chunked(reader, timeout, body)
         elif content_length is not None:
             want = min(max(content_length, 0), _MAX_BODY) - len(body)
             while want > 0:
@@ -278,24 +293,76 @@ async def _http_request_full(
                 writer.close()
             except Exception:
                 pass
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 async def _read_chunked(reader, timeout: float, prefix: bytes = b"") -> bytes:
-    """Decode a chunked transfer body, bounded by ``_MAX_BODY``."""
-    out = bytearray(prefix)
+    """Decode a chunked transfer body, bounded by ``_MAX_BODY``.
+
+    ``prefix`` is the part of the body that was already read together with the
+    response headers.  It *is* raw chunked data (starting with a size line), so
+    it has to be parsed - not prepended to the output.  The previous version
+    passed its length instead of its bytes and then treated the zero-filled
+    buffer as decoded body, which silently corrupted every chunked response
+    whose first chunk arrived with the headers.
+    """
+    buf = bytearray(prefix)
+    out = bytearray()
+    pos = 0
+    eof = False
+
+    async def _fill(want: int) -> None:
+        nonlocal eof
+        while len(buf) - pos < want and not eof:
+            try:
+                chunk = await asyncio.wait_for(reader.read(65536), timeout=timeout)
+            except (asyncio.TimeoutError, OSError):
+                eof = True
+                return
+            if not chunk:
+                eof = True
+                return
+            buf.extend(chunk)
+            # Guard against a peer that declares huge chunks: the output cap is
+            # the real limit, and no single fill needs more than that.
+            if len(buf) > _MAX_BODY + _MAX_HEADER:
+                eof = True
+                return
+
     try:
         while len(out) < _MAX_BODY:
-            size_line = await asyncio.wait_for(reader.readline(), timeout=timeout)
-            if not size_line:
-                break
-            size = int(size_line.split(b";")[0].strip() or b"0", 16)
-            if size == 0:
-                break
-            out += await asyncio.wait_for(reader.readexactly(size), timeout=timeout)
-            await asyncio.wait_for(reader.readexactly(2), timeout=timeout)  # CRLF
-    except (asyncio.TimeoutError, OSError, ValueError, asyncio.IncompleteReadError):
+            while True:
+                end = buf.find(b"\r\n", pos)
+                if end != -1:
+                    break
+                await _fill(len(buf) - pos + 2)
+                if eof and buf.find(b"\r\n", pos) == -1:
+                    return bytes(out[:_MAX_BODY])
+            try:
+                size = int(bytes(buf[pos:end]).split(b";")[0].strip() or b"0", 16)
+            except ValueError:
+                return bytes(out[:_MAX_BODY])
+            pos = end + 2
+            if size <= 0:
+                return bytes(out[:_MAX_BODY])
+            need = min(size, _MAX_BODY - len(out))
+            await _fill(need + 2)
+            take = min(need, len(buf) - pos)
+            out.extend(buf[pos:pos + take])
+            pos += take
+            if take < need or take < size:
+                # Short read (peer closed / stalled) or the output cap was hit.
+                return bytes(out[:_MAX_BODY])
+            # Consume the CRLF after the chunk data.
+            while len(buf) - pos < 2 and not eof:
+                await _fill(len(buf) - pos + 2)
+            pos += 2
+    except (asyncio.TimeoutError, OSError, ValueError):
         pass
-    return bytes(out)
+    return bytes(out[:_MAX_BODY])
 
 
 
@@ -411,6 +478,7 @@ async def run_cve_stage(
     # listed by many CVE entries, and a credential that failed once against a
     # host fails every time.
     tried_creds: set = set()
+    http_entries = []
     for entry in entries:
         if stream_hit:
             break
@@ -431,32 +499,44 @@ async def run_cve_stage(
                 stream_hit = True
             else:
                 await record_cve_test(ip, live.port, entry.id, False)
-
         elif entry.type == "http_probe":
-            # All (port x entry) probes go out concurrently: a dead web panel
-            # costs a full timeout *each*, and running them one after another
-            # made the CVE stage's wall-clock time the sum of every timeout.
-            ports = list(http_ports or DEFAULT_HTTP_PORTS)
-            if stats is not None:
-                stats["cve_tested"] = stats.get("cve_tested", 0) + len(ports)
+            http_entries.append(entry)
 
-            async def _probe_one(hport, e=entry):
-                try:
-                    return hport, await try_http_probe(ip, hport, e, http_timeout)
-                except Exception:
-                    return hport, False
+    # All (entry x port) web-panel probes go out together.  Running them entry
+    # by entry made the stage's wall-clock time the sum of every timeout, and a
+    # host whose RTSP login just succeeded does not need them at all.
+    if http_entries and not stream_hit:
+        ports = list(http_ports or DEFAULT_HTTP_PORTS)
+        if stats is not None:
+            stats["cve_tested"] = (
+                stats.get("cve_tested", 0) + len(http_entries) * len(ports)
+            )
 
-            results = await asyncio.gather(*(_probe_one(hp) for hp in ports))
-            for hport, ok in results:
-                await record_cve_test(ip, hport, entry.id, ok)
-                if ok:
-                    # The panel is vulnerable, but it gives us no RTSP
-                    # credentials: report it without claiming a stream.
-                    found.append(Found(
-                        ip=ip, port=hport, route=entry.url_path,
-                        credentials="", vendor=vendor,
-                        is_http_cve=True, cve_id=entry.id,
-                    ))
+        async def _probe_one(entry, hport):
+            try:
+                return entry, hport, await try_http_probe(
+                    ip, hport, entry, http_timeout
+                )
+            except Exception:
+                return entry, hport, False
+
+        results = await asyncio.gather(
+            *(_probe_one(entry, hp) for entry in http_entries for hp in ports),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                continue
+            entry, hport, ok = result
+            await record_cve_test(ip, hport, entry.id, ok)
+            if ok:
+                # The panel is vulnerable, but it gives us no RTSP
+                # credentials: report it without claiming a stream.
+                found.append(Found(
+                    ip=ip, port=hport, route=entry.url_path,
+                    credentials="", vendor=vendor,
+                    is_http_cve=True, cve_id=entry.id,
+                ))
 
     return found
 

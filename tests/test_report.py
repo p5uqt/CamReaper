@@ -159,6 +159,7 @@ def test_write_summary(tmp_path):
         "found_no_frame": 1,
             "cve_found": 0,
             "cve_tested": 0,
+            "onvif_found": 0,
             "http_checked": 0,
             "http_found": 0,
             "errors": 0,

@@ -14,12 +14,15 @@ import asyncio
 import re
 from enum import Enum
 
+from CamReaper import ratelimit
+
 # Read `User-Agent` / WWW-Authenticate headers up to this many bytes at most.
 MAX_HEADER_BYTES = 64 * 1024
 
 _STATUS_RE = re.compile(r"RTSP/(\d+\.\d+) (\d{3})")
 _REALM_RE = re.compile(r'realm="([^"]*)"', re.IGNORECASE)
 _NONCE_RE = re.compile(r'nonce="([^"]*)"', re.IGNORECASE)
+_CONTENT_LENGTH_RE = re.compile(rb"content-length:\s*(\d+)", re.IGNORECASE)
 
 
 class Status(Enum):
@@ -84,6 +87,10 @@ class RTSPClient:
         self.cseq = 0
         self.data = ""
         try:
+            # Global pacing (--rate-limit): one token per *new* connection.
+            # Reusing a keep-alive socket is free, which is the point - a scan
+            # that can stay on one connection is not penalised.
+            await ratelimit.acquire()
             self.reader, self.writer = await asyncio.wait_for(
                 asyncio.open_connection(self.ip, port), timeout=self.timeout
             )
@@ -122,11 +129,17 @@ class RTSPClient:
         )
 
     async def _read_response(self) -> None:
-        """Read RTSP headers (up to ``\r\n\r\n``) into ``self.data``.
+        """Read one RTSP response header block into ``self.data``.
 
         Raises ConnectionError if the peer closed before sending a complete
         header block, so the caller can drop this socket and retry.  The reason
         is recorded in ``self.last_error`` for the scanner's failure log.
+
+        Any response body announced by ``Content-Length`` is drained from the
+        socket (and discarded).  Without that drain, the SDP body of a
+        ``200 OK`` DESCRIBE stays queued and the *next* request on this
+        keep-alive connection reads it as if it were a status line - which made
+        a reused connection look like a dead host.
         """
         head = bytearray()
         while b"\r\n\r\n" not in head:
@@ -144,7 +157,34 @@ class RTSPClient:
             if len(head) > MAX_HEADER_BYTES:
                 self.last_error = "headers-too-large"
                 raise ConnectionError("response headers too large")
-        self.data = bytes(head).decode("utf-8", errors="replace")
+        end = head.index(b"\r\n\r\n") + 4
+        header_bytes = bytes(head[:end])
+        self.data = header_bytes.decode("utf-8", errors="replace")
+
+        match = _CONTENT_LENGTH_RE.search(header_bytes)
+        if not match:
+            return
+        try:
+            remaining = int(match.group(1)) - (len(head) - end)
+        except ValueError:
+            return
+        while remaining > 0:
+            try:
+                chunk = await asyncio.wait_for(
+                    self.reader.read(min(remaining, 65536)), timeout=self.timeout
+                )
+            except (asyncio.TimeoutError, OSError):
+                # The header we already parsed is still valid; only the socket
+                # is unusable for another request, so drop it without losing
+                # the status code.
+                self.reader = self.writer = None
+                self.last_error = "timeout"
+                return
+            if not chunk:
+                self.reader = self.writer = None
+                self.last_error = "closed"
+                return
+            remaining -= len(chunk)
 
     # ------------------------------------------------------------- parsing
 
@@ -257,4 +297,6 @@ class RTSPClient:
     @staticmethod
     def get_rtsp_url(ip, port=554, credentials=":", route="/") -> str:
         prefix = f"{credentials}@" if credentials and credentials != ":" else ""
-        return f"rtsp://{prefix}{ip}:{port}{route}"
+        # IPv6 literals must be bracketed in a URL authority.
+        host = f"[{ip}]" if ":" in str(ip) and not str(ip).startswith("[") else ip
+        return f"rtsp://{prefix}{host}:{port}{route}"

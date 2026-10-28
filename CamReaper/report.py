@@ -12,6 +12,8 @@ import html
 import json
 import re
 import shutil
+import sys
+import time
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -28,6 +30,9 @@ CVE_LOG_FILE: Optional[Path] = (
 )
 HTTP_CVE_FILE: Optional[Path] = (
     None  # set by __main__ to log HTTP CVE-probe hits (non-RTSP)
+)
+FINDINGS_FILE: Optional[Path] = (
+    None  # set by __main__ to append structured findings (JSON Lines)
 )
 _locks: Dict[object, asyncio.Lock] = {}
 
@@ -54,6 +59,24 @@ _handles: Dict[Path, object] = {}
 _buffers: Dict[Path, list] = {}
 # flush a path's buffer to disk once it holds at least this many lines.
 _FLUSH_LINES = 1000
+# Set after the first write failure, so a full disk produces one warning
+# instead of one traceback per host (the scan itself must keep running).
+_io_error_reported = False
+
+
+def _report_io_error(path: Path, exc: OSError) -> None:
+    global _io_error_reported
+    if _io_error_reported:
+        return
+    _io_error_reported = True
+    try:
+        sys.stderr.write(
+            f"[warn] cannot write {path}: {exc} - continuing scan "
+            f"(further write errors are suppressed)\n"
+        )
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 _HTML_HEADER = """<!DOCTYPE html>
 <html>
@@ -206,18 +229,60 @@ def _flush_buffers(paths) -> None:
         buf = _buffers.get(p)
         if not buf:
             continue
-        handle = _handles.get(p)
-        if handle is None:
-            handle = p.open("a", encoding="utf-8")
-            _handles[p] = handle
-        handle.write("".join(buf))
-        buf.clear()
-        handle.flush()
+        try:
+            handle = _handles.get(p)
+            if handle is None:
+                handle = p.open("a", encoding="utf-8")
+                _handles[p] = handle
+            handle.write("".join(buf))
+            handle.flush()
+        except OSError as exc:
+            # A full/unwritable disk must not turn every remaining host into an
+            # error (or let its buffer grow without bound).  Drop this batch,
+            # warn once, and let the scan finish.
+            _report_io_error(p, exc)
+            _handles.pop(p, None)
+        finally:
+            buf.clear()
 
 
 async def record_url(url: str) -> None:
     """Write one found stream URL to result.txt (always, screenshot or not)."""
     await _append(RESULT_FILE, f"{url}\n")
+
+
+async def record_finding(
+    ip: str,
+    port: int,
+    route: str,
+    credentials: str,
+    vendor: str,
+    url: str,
+    cve_id: str = "",
+) -> None:
+    """Append one structured finding as a JSON line (findings.jsonl).
+
+    ``result.txt`` is deliberately just URLs: easy to feed to a player, but it
+    loses the vendor/port/CVE metadata a large scan has to post-process.  This
+    side file carries one JSON object per confirmed stream so an external
+    pipeline can filter or aggregate without re-parsing RTSP URLs.  No-op
+    unless ``FINDINGS_FILE`` is configured.
+    """
+    if FINDINGS_FILE is None:
+        return
+    record = {
+        "ip": ip,
+        "port": port,
+        "route": route,
+        "credentials": credentials,
+        "vendor": vendor,
+        "url": url,
+        "cve_id": cve_id or None,
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    await _append(
+        FINDINGS_FILE, json.dumps(record, ensure_ascii=False) + "\n"
+    )
 
 
 async def record_failed(ip: str, port: int, error: str = "") -> None:
@@ -306,18 +371,36 @@ def _split_stream_url(url: str):
     so ``report`` stays free of a circular import.  Missing pieces come back
     empty / at the RTSP default of 554.
     """
-    from urllib.parse import unquote
+    from urllib.parse import unquote, urlsplit
 
     s = str(url)
+    try:
+        parts = urlsplit(s)
+        host = parts.hostname or ""
+        try:
+            port = str(parts.port or 554)
+        except ValueError:
+            port = "554"
+        user = unquote(parts.username) if parts.username else ""
+        password = unquote(parts.password) if parts.password else ""
+        return host, port, user, password
+    except ValueError:
+        pass
+    # Fallback for strings urlsplit refuses (e.g. an unescaped bad authority).
     s = s[len("rtsp://"):] if s.lower().startswith("rtsp://") else s
     authority = s.split("/", 1)[0]
     userinfo = ""
     if "@" in authority:
         userinfo, _, authority = authority.rpartition("@")
-    host, _, port_s = authority.partition(":")
+    if authority.startswith("["):
+        host, _, tail = authority.partition("]")
+        host = host[1:]
+        port_s = tail.lstrip(":")
+    else:
+        host, _, port_s = authority.partition(":")
     port = port_s if port_s.isdigit() else "554"
     user = password = ""
-    if userinfo and ":" in userinfo:
+    if userinfo:
         raw_user, _, raw_pass = userinfo.partition(":")
         user, password = unquote(raw_user), unquote(raw_pass)
     return host, port, user, password
@@ -419,7 +502,7 @@ async def close_report_files() -> None:
         # Ensure every configured output file exists even if nothing was
         # buffered for it yet (buffering defers file creation to first flush).
         for path in (RESULT_FILE, HTML_FILE, FAILED_FILE, NO_AUTH_FILE,
-                     CVE_LOG_FILE, HTTP_CVE_FILE):
+                     CVE_LOG_FILE, HTTP_CVE_FILE, FINDINGS_FILE):
             if path is not None:
                 try:
                     path.touch()
@@ -474,8 +557,8 @@ def write_summary(path: Path, stats: dict, elapsed: float = 0.0) -> None:
         "statistics": {
             k: stats.get(k, 0)
             for k in ("checked", "found", "screenshots", "found_no_frame",
-                      "cve_found", "cve_tested", "http_checked", "http_found",
-                      "errors")
+                      "cve_found", "cve_tested", "onvif_found", "http_checked",
+                      "http_found", "errors")
         },
         "vendors": stats.get("vendors", {}),
         "ports": stats.get("ports", {}),

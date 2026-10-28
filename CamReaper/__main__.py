@@ -12,11 +12,20 @@ from CamReaper import report, screenshot
 from CamReaper.cli import parser
 from CamReaper.gallery import build_from_urls, iter_url_list
 from CamReaper.scanner import Settings, run
-from CamReaper.targets import count_targets, describe as describe_targets, iter_targets, iter_unique
+from CamReaper.targets import (
+    describe as describe_targets,
+    estimate_targets,
+    iter_excluding,
+    iter_shard,
+    iter_slice,
+    iter_targets,
+    iter_unique,
+    parse_exclusions,
+)
 
 
 def _load_lines(path: Path):
-    return path.read_text(encoding="utf-8").splitlines()
+    return path.read_text(encoding="utf-8", errors="replace").splitlines()
 
 
 def _load_list(path: Path) -> list:
@@ -83,20 +92,22 @@ def _write_checkpoint(path: Path, checked_ips, stats) -> None:
 
     Stats go to the JSON (small rewrite); finished IPs are *appended* to the
     companion .ips file, so history is never re-written.  ``checked_ips`` is a
-    list of IPs completed since the previous flush and is drained here.
+    list of IPs completed since the previous flush and is drained here - even if
+    a write failed, so a full disk cannot grow that list without bound and take
+    the scan down with it.
     """
     if path is None:
         return
     try:
         path.write_text(json.dumps({"stats": stats}, indent=2), encoding="utf-8")
     except OSError:
-        return
+        pass
     if checked_ips:
         try:
             with _ips_path(path).open("a", encoding="utf-8") as f:
                 f.write("\n".join(checked_ips) + "\n")
         except OSError:
-            return
+            pass
     checked_ips.clear()
 
 
@@ -193,25 +204,35 @@ def _capture_from_results(results_file: Path, args) -> None:
             file=sys.stdout if tty else None,
             disable=not tty,
         )
-        sem = asyncio.Semaphore(concurrency)
+        screenshot.install_executor(concurrency)
         pics: dict = {}
         done = 0
+        cursor = 0
+        total = len(urls)
 
-        async def _one(url: str):
-            nonlocal done
-            async with sem:
+        async def _worker():
+            nonlocal done, cursor
+            while True:
+                index = cursor
+                if index >= total:
+                    return
+                cursor = index + 1
+                url = urls[index]
                 pic = await screenshot.capture(url, images_dir, timeout)
-            if pic:
-                pics[url] = f"images/{Path(pic).name}"
-            done += 1
-            if bar.total is None:
-                bar.total = len(urls)
-                bar.refresh()
-            bar.update(1)
+                if pic:
+                    pics[url] = f"images/{Path(pic).name}"
+                done += 1
+                if bar.total is None:
+                    bar.total = total
+                    bar.refresh()
+                bar.update(1)
 
         try:
-            tasks = [asyncio.create_task(_one(u)) for u in urls]
-            await asyncio.gather(*tasks, return_exceptions=True)
+            workers = min(max(1, concurrency), total)
+            await asyncio.gather(
+                *(asyncio.create_task(_worker()) for _ in range(workers)),
+                return_exceptions=True,
+            )
             await report.write_gallery_sections(list(pics.items()), report.HTML_FILE)
             return len(pics)
         finally:
@@ -233,6 +254,44 @@ def _capture_from_results(results_file: Path, args) -> None:
     print(_c(f"[done] images: {images_dir}"))
 
 
+def _new_report_folder(root: Path, name: str) -> Path:
+    """Atomically create ``root/name`` (or ``name-2``, ``name-3``, ...).
+
+    Two runs started in the same second - easy to do from a launcher script or
+    when several shards share a machine - used to pick the same folder and
+    overwrite each other's result.txt and index.html.  ``mkdir`` without
+    ``exist_ok`` is the atomic arbiter; the loser retries with a suffix.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    for attempt in range(1, 1000):
+        candidate = root / (name if attempt == 1 else f"{name}-{attempt}")
+        try:
+            candidate.mkdir()
+            return candidate
+        except FileExistsError:
+            continue
+    raise OSError(f"cannot create a unique report folder under {root}")
+
+
+def _install_stop_signals() -> None:
+    """Make SIGTERM take the graceful path (save checkpoint, write reports).
+
+    Interactive runs get Ctrl+C, but a long scan is usually run under systemd,
+    Docker or a scheduler that sends SIGTERM.  Converting it into
+    ``KeyboardInterrupt`` lets the existing shutdown branch persist the
+    checkpoint instead of losing the finished hosts.
+    """
+    import signal
+
+    def _stop(signum, frame):
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _stop)
+    except (ValueError, OSError, AttributeError):
+        pass
+
+
 def main():
     args = parser.parse_args()
 
@@ -246,13 +305,41 @@ def main():
         _capture_from_results(args.capture, args)
         return
 
+    # Dry run: count what this invocation would scan, then stop.  The count is
+    # arithmetic (no address is expanded), so it stays instant on a /8.
+    if args.count_only:
+        total = estimate_targets(args.targets)
+        if args.shard:
+            index, shards = args.shard
+            total = (
+                (total + shards - 1 - index) // shards if total > index else 0
+            )
+        total = max(total - args.skip, 0)
+        if args.limit:
+            total = min(total, args.limit)
+        exact = not args.exclude and not args.dedup
+        prefix = "" if exact else "~"
+        print(
+            _c(
+                f"[info] targets={describe_targets(args.targets)} "
+                f"ips={prefix}{total}"
+            )
+        )
+        return
+
     start = time.strftime("%Y.%m.%d-%H.%M.%S")
-    report_folder = Path.cwd() / "reports" / start
+    if args.shard:
+        index, shards = args.shard
+        # A shard started in the same second as its siblings must not share a
+        # report folder (and overwrite its result.txt).
+        start = f"{start}-shard{index + 1}of{shards}"
+    report_folder = _new_report_folder(Path.cwd() / "reports", start)
     pics_dir = report_folder / "pics"
     pics_dir.mkdir(parents=True, exist_ok=True)
 
     report.RESULT_FILE = report_folder / "result.txt"
     report.HTML_FILE = report_folder / "index.html"
+    report.FINDINGS_FILE = report_folder / "findings.jsonl"
     report.RESULT_FILE.touch()
     report.init_html(report.HTML_FILE)
 
@@ -457,14 +544,23 @@ def main():
             else:
                 print(_c(f"[warn] CVE database not found: {db_path}, skipping CVE stage", "33"))
 
-    n_targets = count_targets(args.targets)
+    n_targets = estimate_targets(args.targets)
     if checked:
         total = max(n_targets - len(checked), 0)
     else:
         total = n_targets
+    if args.shard:
+        _index, _shards = args.shard
+        total = (total + _shards - 1 - _index) // _shards if total > _index else 0
+    if args.skip:
+        total = max(total - args.skip, 0)
+    if args.limit:
+        total = min(total, args.limit)
     print(
         _c(
-            f"[info] mode={args.mode} targets={describe_targets(args.targets)} ips={total}/{n_targets} ports={ports} "
+            f"[info] mode={args.mode} "
+            f"targets={describe_targets(args.targets)} "
+            f"ips={total}/{n_targets} ports={ports} "
             f"routes={len(routes)} creds={len(credentials)}"
         )
     )
@@ -513,6 +609,9 @@ def main():
         # supplied credentials: the scanner's full wordlist is sized for RTSP
         # bruting, and replaying thousands of it over SOAP would be pointless.
         onvif_creds=list(credentials) if (credentials and args.onvif) else [],
+        rate_limit=args.rate_limit,
+        https_ports=list(args.https_ports),
+        expected_total=total,
     )
 
     # Local mirror of the live stats; ``show`` copies the scanner's own dict here
@@ -526,6 +625,7 @@ def main():
         "ports": {},
         "cve_found": 0,
         "cve_tested": 0,
+        "onvif_found": 0,
         "http_checked": 0,
         "http_found": 0,
         "errors": 0,
@@ -547,20 +647,27 @@ def main():
             "found_no_frame": stats["found_no_frame"] + base["found_no_frame"],
             "cve_found": stats["cve_found"],
             "cve_tested": stats["cve_tested"],
+            "onvif_found": stats.get("onvif_found", 0),
             "http_checked": stats["http_checked"],
             "http_found": stats["http_found"],
             "errors": stats["errors"],
             "error_samples": list(stats.get("error_samples", ())),
         }
 
-    # Compose the (possibly deduped) scan iterator.  The original targets Path is
-    # kept for counting - never swapped out.
+    # Compose the (possibly deduped, filtered, sharded, sliced) scan iterator.
+    # The original targets Path is kept for counting - never swapped out.
     if checked:
         scan_iter = _resumed_targets(args.targets, checked)
     else:
         scan_iter = iter_targets(args.targets)
     if args.dedup:
         scan_iter = iter_unique(scan_iter, args.dedup_size)
+    if args.exclude:
+        scan_iter = iter_excluding(scan_iter, parse_exclusions(args.exclude))
+    if args.shard:
+        scan_iter = iter_shard(scan_iter, *args.shard)
+    if args.skip or args.limit:
+        scan_iter = iter_slice(scan_iter, args.skip, args.limit)
 
     tty = sys.stdout.isatty()
     t0 = time.monotonic()
@@ -578,8 +685,8 @@ def main():
             checked.add(ip)
             pending_ips.append(ip)
         for k in ("checked", "found", "screenshots", "found_no_frame",
-                  "cve_found", "cve_tested", "http_checked", "http_found",
-                  "errors"):
+                  "cve_found", "cve_tested", "onvif_found", "http_checked",
+                  "http_found", "errors"):
             stats[k] = current[k]
         stats["error_samples"] = list(current.get("error_samples", ()))
         stats["vendors"] = current["vendors"]
@@ -595,9 +702,14 @@ def main():
         def hi(v):
             return f"\033[32m{v}\033[0m" if tty else str(v)
 
+        eta = info.get("eta")
+        eta_text = f"{eta:.0f}s" if eta is not None else "-"
         pbar.set_postfix_str(
             f"found={hi(info['found'])} "
-            f"shots={hi(info['screenshots'])} in-flight={hi(info['inflight'])}",
+            f"shots={hi(info['screenshots'])} "
+            f"rate={info.get('rate', 0):.1f}/s "
+            f"eta={eta_text} "
+            f"in-flight={hi(info['inflight'])}",
             refresh=False,
         )
 
@@ -623,6 +735,7 @@ def main():
             await report.close_report_files()
 
     try:
+        _install_stop_signals()
         asyncio.run(_run_scan())
     except KeyboardInterrupt:
         finish()

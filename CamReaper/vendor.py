@@ -67,18 +67,21 @@ def _load_vendors() -> tuple:
 def _match(needles, realm_needles, realm_re, text: str, realm: str) -> bool:
     """True when the vendor's configured signals match.
 
-    A vendor is identified when **any** of its signals fires; a vendor that
-    configures no signal at all (Generic) matches unconditionally.
+    A vendor that configures no signal at all (Generic) matches unconditionally.
+    Every configured signal is tried; a match on any of them identifies the
+    vendor.  The previous condition treated a *regex-only* vendor as
+    "nothing configured" and then returned False, so such an entry could never
+    match - and it also made the Generic catch-all check branch the wrong way.
     """
-    if needles or realm_needles or realm_re is None:
-        # Something was configured, so something has to match.
-        if not (
-            (needles and any(n in text for n in needles))
-            or (realm_needles and any(n in realm.lower() for n in realm_needles))
-            or (realm_re is not None and realm_re.match(realm))
-        ):
-            return False
-    return True
+    if not needles and not realm_needles and realm_re is None:
+        return True
+    if needles and any(n in text for n in needles):
+        return True
+    if realm_needles and any(n in realm.lower() for n in realm_needles):
+        return True
+    if realm_re is not None and realm_re.search(realm):
+        return True
+    return False
 
 
 def detect_vendor(data: str) -> str:

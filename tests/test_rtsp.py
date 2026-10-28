@@ -27,6 +27,54 @@ async def test_connect_and_read_status(mock):
     assert c.status_code == "200"
 
 
+@pytest.mark.parametrize("mock", ["open"], indirect=True)
+async def test_new_connection_takes_a_global_rate_limit_token(monkeypatch, mock):
+    calls = []
+
+    async def fake_acquire(tokens=1.0):
+        calls.append(tokens)
+
+    monkeypatch.setattr("CamReaper.rtsp.ratelimit.acquire", fake_acquire)
+    c = RTSPClient(mock.host, mock.port, timeout=2, credentials=":")
+    assert await c.connect()
+    assert calls  # one token for the new socket
+    n = len(calls)
+    assert await c.connect()  # keep-alive reuse is free
+    assert len(calls) == n
+
+
+async def test_response_body_is_drained_for_keepalive():
+    """A DESCRIBE 200 carries an SDP body.  It must be consumed, otherwise the
+    next response on the same socket starts with leftover SDP and the reused
+    connection looks dead."""
+
+    class _Reader:
+        def __init__(self, data):
+            self.data = data
+
+        async def read(self, n):
+            n = min(n, 10)  # small chunks: the response arrives in pieces
+            chunk, self.data = self.data[:n], self.data[n:]
+            return chunk
+
+    first = (
+        b"RTSP/1.0 200 OK\r\n"
+        b"Server: Cam\r\n"
+        b"Content-Length: 23\r\n\r\n"
+        b"v=0\r\no=- 1 1 IN IP4 1\r\n"
+    )
+    second = b"RTSP/1.0 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"
+    client = RTSPClient("127.0.0.1", 554, timeout=1, credentials=":")
+    client.reader = _Reader(first + second)
+
+    await client._read_response()
+    assert client.status_code == "200"
+    assert client.reader.data == second
+
+    await client._read_response()
+    assert client.status_code == "401"
+
+
 @pytest.mark.parametrize("mock", ["auth-401"], indirect=True)
 async def test_auth_required_returns_401(mock):
     c = RTSPClient(mock.host, mock.port, timeout=2, credentials=":")

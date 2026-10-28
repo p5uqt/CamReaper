@@ -80,6 +80,20 @@ def test_generic_never_shadows_a_specific_signature():
     assert detect_vendor(_rtsp(server="DahuaTech", realm="IP Camera")) == "Dahua"
 
 
+def test_regex_only_vendor_can_match():
+    """A vendor configured only with ``realm_regex`` used to be treated as
+    "nothing configured" and never matched at all."""
+    import re
+
+    from CamReaper.vendor import _match
+
+    rx = re.compile(r"IP\s+Camera", re.IGNORECASE)
+    assert _match((), (), rx, "", "ip camera") is True
+    assert _match((), (), rx, "", "something else") is False
+    # A vendor with no signals at all is the catch-all.
+    assert _match((), (), None, "", "anything") is True
+
+
 # --- XMEye / Xiongmai name mismatch -------------------------------------------
 
 

@@ -20,7 +20,9 @@ Scans networks for RTSP camera streams, brute-forces routes and credentials, cap
 - **CVE exploits** - vendor-aware scans (`brute` / `cve` / `combined`) using backdoor credentials and HTTP probes against 26+ documented CVEs (Hikvision, Dahua, Zosi, Xiongmai, PTZOptics, Sony, V380, AVTECH, ...)
 - **HTTP fallback probing** - hosts with no live RTSP port are probed on their web panel (80/443/8080) for CVE vulnerabilities
 - **Deduplication** - LRU-based IP dedup for overlapping CIDRs/ranges
-- **Report output** - result.txt, streams.m3u, summary.json, failed.txt, noauth.txt, cve_log.txt, http_cve.txt
+- **Large-scan controls** - deterministic target sharding across machines (`--shard 2/4`), chunked runs (`--skip`/`--limit`), network exclusions (`--exclude`), a global new-connection rate limit (`--rate-limit`), and instant dry-run counting (`--count-only`)
+- **Structured findings** - `findings.jsonl` records every confirmed stream with vendor/port/route/CVE metadata for downstream processing
+- **Report output** - result.txt, streams.m3u, summary.json, findings.jsonl, failed.txt, noauth.txt, cve_log.txt, http_cve.txt
 
 ---
 
@@ -80,9 +82,16 @@ CamReaper [OPTIONS]
 | `--route-parallel N` | `8` | Routes probed in parallel (0 = serial) |
 | `--dedup` | off | Skip duplicate IPs from overlapping ranges |
 | `--dedup-size N` | `1000000` | LRU cache size for dedup |
+| `--exclude SPEC` | - | Skip a file/CIDR/range/IP; repeatable. Applied after `--dedup` |
+| `--shard INDEX/TOTAL` | - | Scan one deterministic disjoint slice, e.g. `2/4` for distributed scans |
+| `--skip N` | `0` | Skip the first N targets of this run (after `--shard`) |
+| `--limit N` | `0` (all) | Stop after N targets of this run |
+| `--count-only` | off | Print how many targets would be scanned and exit (no network) |
+| `--rate-limit N` | `0` (none) | Global cap on new connections per second across all hosts |
 | `--mode MODE` | `brute` | Scan strategy: `brute` (default), `cve` (CVE only), `combined` (CVE first, then brute) |
 | `--cve-db PATH` | built-in | Path to a custom CVE database JSON file |
 | `--http-ports PORTS` | `80 443 8080` | HTTP/HTTPS ports probed for CVEs on hosts with no live RTSP port; ranges allowed (`8000-8008`) |
+| `--https-ports PORTS` | `443 8443` | Subset of `--http-ports` probed over TLS |
 | `--no-http` | off | Disable the HTTP CVE-probe fallback |
 | `--http-timeout S` | `5.0` | Socket timeout in seconds for CVE HTTP probes |
 | `--onvif` | off in `brute` | Ask each host for its stream URL over ONVIF (SOAP `GetProfiles`/`GetStreamUri`). Implied by `cve` and `combined` |
@@ -155,6 +164,26 @@ CamReaper -t 10.0.0.1,10.0.0.2,10.0.0.3 -p 554 8554
 CamReaper -t huge_list.txt --checkpoint --resume
 ```
 
+### Split a huge range across machines
+
+Each shard scans a deterministic, disjoint subset of the same input, so four
+hosts can work on a `/16` without coordination:
+
+```bash
+CamReaper -t 10.0.0.0/16 --shard 1/4 --rate-limit 500
+CamReaper -t 10.0.0.0/16 --shard 2/4 --rate-limit 500
+CamReaper -t 10.0.0.0/16 --shard 3/4 --rate-limit 500
+CamReaper -t 10.0.0.0/16 --shard 4/4 --rate-limit 500
+```
+
+### Scan a big list in chunks, excluding noisy ranges
+
+```bash
+CamReaper -t huge_list.txt --exclude 10.0.10.0/24 --exclude excludes.txt
+CamReaper -t huge_list.txt --skip 1000000 --limit 1000000
+CamReaper -t 10.0.0.0/8 --count-only     # instant: no address is expanded
+```
+
 ### Build gallery from previous results
 
 ```bash
@@ -166,6 +195,7 @@ CamReaper --capture reports/2026.09.01-12.00.00/result.txt
 
 ```bash
 CamReaper -t targets.txt --attempts-per-sec 5 --max-attempts 10 --host-timeout 30
+CamReaper -t 10.0.0.0/8 --rate-limit 500 --no-screenshots
 ```
 
 ### Scan with CVE exploits
@@ -194,6 +224,34 @@ CamReaper -t targets.txt --onvif --onvif-ports 8000 8080 34567
 CamReaper -t targets.txt --onvif --onvif-profiles 8
 CamReaper -t targets.txt --mode combined --no-onvif
 ```
+
+---
+
+## Large-Scale Scanning
+
+A scan of millions of addresses needs more than a high concurrency number. The
+following controls are designed to be combined:
+
+1. **Watch the cost first** - `--count-only` prints the exact number of targets
+   this invocation would scan without expanding a single address.
+2. **Pick a slice** - `--shard I/N` gives this process every N-th target
+   starting at I (1-based). Shards are disjoint and deterministic, so N
+   machines can share one input file and each writes its own
+   `reports/<timestamp>-shardIofN/` folder.
+3. **Pace the whole process** - `--rate-limit N` bounds *new connections per
+   second across every host*, while `--attempts-per-sec` still bounds the
+   credential attempts against one camera (lockout protection). Route sweeps,
+   ONVIF probes and CVE HTTP probes all draw from the same bucket.
+4. **Filter noise** - `--exclude` removes CIDRs, ranges, single IPs or a file
+   of them after dedup; `--skip`/`--limit` carve out one chunk of a list.
+5. **Keep it resumable** - `--checkpoint` appends finished IPs to a companion
+   `.ips` file, so even a SIGTERM saves progress. `--resume` skips them.
+6. **Process the results** - `findings.jsonl` is JSON Lines: one object per
+   confirmed stream, including vendor and CVE metadata, ready for
+   `jq`/pandas/whatever without re-parsing RTSP URLs.
+
+Progress output also reports the current hosts/second and an ETA derived from
+`--count-only`-style arithmetic (no target list is materialised).
 
 ---
 
@@ -332,6 +390,7 @@ Each run creates a timestamped folder under `reports/<timestamp>/`:
 | `result.txt` | Confirmed stream URLs (one per line) |
 | `streams.m3u` | Same URLs as M3U playlist (open in VLC) |
 | `summary.json` | Statistics: checked, found, screenshots, cve/http counters, host errors, vendor/port breakdown |
+| `findings.jsonl` | One JSON object per confirmed stream (`ip`, `port`, `route`, `credentials`, `vendor`, `url`, `cve_id`, `ts`) |
 | `pics/` | Captured screenshots |
 | `index.html` | Interactive gallery with click-to-copy and fullscreen |
 | `checkpoint.json` | Resume state (if `--checkpoint` was used) |

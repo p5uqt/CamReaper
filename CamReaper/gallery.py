@@ -11,7 +11,7 @@ Used by two CLI flags:
 import asyncio
 import re
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 from CamReaper import report, screenshot
 from CamReaper.rtsp import RTSPClient
@@ -39,22 +39,46 @@ def _split_url(url: str):
     """Parse ``rtsp://[user:pass@]host[:port]/route``.
 
     Returns ``(host, port, creds, route)``.  ``creds`` is ``"user:pass"`` when
-    present, else ``":"`` (no auth).  ``port`` defaults to 554, ``route`` to
-    ``/``.
+    present (``"user:"`` for a username without a password), else ``":"`` (no
+    auth).  ``port`` defaults to 554, ``route`` to ``/``.
     """
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        try:
+            port = parts.port or _DEFAULT_PORT
+        except ValueError:
+            port = _DEFAULT_PORT
+        if parts.username:
+            user = unquote(parts.username)
+            password = unquote(parts.password) if parts.password is not None else ""
+            creds = f"{user}:{password}"
+        else:
+            creds = ":"
+        route = parts.path or "/"
+        if parts.query:
+            route = f"{route}?{parts.query}"
+        if host:
+            return host, port, creds, route
+    except ValueError:
+        pass
+
+    # Fallback for malformed authorities urlsplit refuses.
     s = url[len("rtsp://"):] if url.lower().startswith("rtsp://") else url
     authority, sep, route = s.partition("/")
     route = "/" + route if sep else "/"
     userinfo = ""
     if "@" in authority:
         userinfo, _, authority = authority.partition("@")
-    host, _, port_s = authority.partition(":")
-    if not port_s.isdigit():
-        port = _DEFAULT_PORT
+    if authority.startswith("["):
+        host, _, tail = authority.partition("]")
+        host = host[1:]
+        port_s = tail.lstrip(":")
     else:
-        port = int(port_s)
-    if userinfo and ":" in userinfo:
-        creds = unquote(userinfo)
+        host, _, port_s = authority.partition(":")
+    port = int(port_s) if port_s.isdigit() else _DEFAULT_PORT
+    if userinfo:
+        creds = unquote(userinfo) if ":" in userinfo else f"{unquote(userinfo)}:"
     else:
         creds = ":"
     return host, port, creds, route
@@ -93,7 +117,8 @@ async def build_probed_urls(urls, routes, route_parallel: int = 0):
 
     def url_for(host, port, creds, route):
         prefix = f"{creds}@" if creds != ":" else ""
-        return f"rtsp://{prefix}{host}:{port}{route}"
+        h = f"[{host}]" if ":" in host and not host.startswith("[") else host
+        return f"rtsp://{prefix}{h}:{port}{route}"
 
     for u in urls:
         try:
@@ -105,7 +130,12 @@ async def build_probed_urls(urls, routes, route_parallel: int = 0):
         cands.setdefault(k, set()).update(channel_variants(u))
 
     if routes:
-        for (host, port), creds_set in host_creds.items():
+        # Probe cameras concurrently: a large scan can have thousands of
+        # confirmed streams, and doing one host after another made the
+        # post-scan channel pass take hours.  Each camera's routes are still
+        # probed with the caller's route_parallel.
+        async def _probe_camera(key, creds_set):
+            host, port = key
             opened: set = set()
             for creds in creds_set:
                 try:
@@ -118,6 +148,17 @@ async def build_probed_urls(urls, routes, route_parallel: int = 0):
                     continue
             for creds, route in opened:
                 cands[(host, port)].add(url_for(host, port, creds, route))
+
+        sem = asyncio.Semaphore(8)
+
+        async def _guarded(key, creds_set):
+            async with sem:
+                await _probe_camera(key, creds_set)
+
+        await asyncio.gather(
+            *(_guarded(k, v) for k, v in host_creds.items()),
+            return_exceptions=True,
+        )
 
     flat = {u for urls in cands.values() for u in urls}
     return sorted(flat)
@@ -187,24 +228,44 @@ async def build_from_urls(
         candidates = await build_probed_urls(urls, routes, route_parallel)
     else:
         candidates = [v for u in urls for v in channel_variants(u)]
-    sem = asyncio.Semaphore(concurrency)
+    if not candidates:
+        await report.write_gallery_sections([], html_file)
+        return 0
+
+    # Capture in a bounded worker pool instead of one task per candidate: a
+    # large URL list expands to tens of thousands of channels (16 per Hikvision
+    # camera, 16 per ONVIF camera), and a task object per channel is pure
+    # memory overhead with no extra throughput.
+    screenshot.install_executor(concurrency)
     total = len(candidates)
+    workers = min(max(1, concurrency), total)
     pics: list = []
+    cursor = 0
     done = 0
 
-    async def _one(url: str):
-        nonlocal done
-        async with sem:
+    async def _worker():
+        nonlocal cursor, done
+        while True:
+            index = cursor
+            if index >= total:
+                return
+            cursor = index + 1
+            url = candidates[index]
             pic = await screenshot.capture(url, pics_dir, timeout)
-        if pic:
-            pics.append((url, f"pics/{Path(pic).name}"))
-        done += 1
-        if progress is not None:
-            await progress(done, total)
+            if pic:
+                pics.append((url, f"pics/{Path(pic).name}"))
+            done += 1
+            if progress is not None:
+                try:
+                    await progress(done, total)
+                except Exception:
+                    pass
 
-    tasks = [asyncio.create_task(_one(v)) for v in candidates]
     # One failing candidate must not cost the whole gallery.
-    await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.gather(
+        *(asyncio.create_task(_worker()) for _ in range(workers)),
+        return_exceptions=True,
+    )
     await report.write_gallery_sections(pics, html_file)
     return len(pics)
 
@@ -216,7 +277,7 @@ def iter_url_list(path: Path):
     capture pipeline, where they would waste a slot (and produce an empty
     "camera" section) for every ``http://`` or plain-IP line in the file.
     """
-    with path.open("r", encoding="utf-8") as f:
+    with path.open("r", encoding="utf-8", errors="replace") as f:
         for raw in f:
             line = raw.strip()
             if not line or line.startswith("#"):

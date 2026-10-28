@@ -19,8 +19,15 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from CamReaper import report
-from CamReaper.report import record_failed, record_gallery, record_http_cve, record_no_auth, record_url
+from CamReaper import ratelimit, report
+from CamReaper.report import (
+    record_failed,
+    record_finding,
+    record_gallery,
+    record_http_cve,
+    record_no_auth,
+    record_url,
+)
 from CamReaper.rtsp import RTSPClient
 from CamReaper.vendor import detect_vendor
 
@@ -144,6 +151,9 @@ class Settings:
     onvif_timeout: float = 5.0
     onvif_profiles: int = 4
     onvif_creds: list = field(default_factory=list)  # empty = onvif defaults
+    rate_limit: float = 0.0  # global new-connection cap per second (0 = off)
+    https_ports: list = field(default_factory=list)  # empty = cve defaults
+    expected_total: int = 0  # for ETA display only (0 = unknown)
 
 
 async def try_auth(client: RTSPClient, cred: str, route: str):
@@ -447,19 +457,26 @@ async def _probe_port(ip: str, port: int, timeout: float):
     return "unconfirmed", client, ""
 
 
-async def _probe_ports(ip: str, s: Settings) -> list:
+async def _probe_ports(ip: str, s: Settings, deadline=None) -> list:
     """Probe every configured port of one host, up to ``PORT_PARALLEL`` at once.
 
-    Returns the per-port ``(state, client, vendor)`` tuples **in port order**,
-    so which port wins does not depend on which answer came back first.  Most
-    targets in a large scan have all their ports closed, and doing that one
-    port after another costs a full socket timeout per port per host.
+    Returns ``(index, state, client, vendor)`` tuples in port order, so which
+    port wins does not depend on which answer came back first.  Most targets in
+    a large scan have all their ports closed, and doing that one port after
+    another costs a full socket timeout per port per host.
+
+    ``deadline`` (a loop time) stops new ports from being started once the
+    host's wall-clock budget is spent; in-flight probes are allowed to finish.
     """
     ports = list(s.ports)
     if not ports:
         return []
+    loop = asyncio.get_running_loop()
     if len(ports) == 1:
-        return [await _probe_port(ip, ports[0], s.timeout)]
+        if deadline is not None and loop.time() >= deadline:
+            return []
+        state, client, vendor = await _probe_port(ip, ports[0], s.timeout)
+        return [(0, state, client, vendor)]
 
     results: dict = {}
     cursor = 0
@@ -471,13 +488,19 @@ async def _probe_ports(ip: str, s: Settings) -> list:
             if index >= len(ports):
                 return
             cursor = index + 1
+            if deadline is not None and loop.time() >= deadline:
+                return
             results[index] = await _probe_port(ip, ports[index], s.timeout)
 
     workers = min(PORT_PARALLEL, len(ports))
     await asyncio.gather(
         *(asyncio.create_task(_worker()) for _ in range(workers))
     )
-    return [results[i] for i in range(len(ports))]
+    return [
+        (index, *results[index])
+        for index in range(len(ports))
+        if index in results
+    ]
 
 
 async def _handle_host(ip: str, s: Settings, stats: dict = None) -> list:
@@ -488,15 +511,23 @@ async def _handle_host(ip: str, s: Settings, stats: dict = None) -> list:
     """
     found: list = []
 
+    # A pathological camera (accepts the port but stalls mid-brute) must not
+    # occupy its host slot for ~one timeout per credential.  The wall-clock
+    # budget covers the WHOLE pipeline, starting with port probing - it used to
+    # start only after a live port was found, so a host with many configured
+    # ports could burn the budget before the deadline even existed.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + s.host_timeout if s.host_timeout > 0 else None
+
     # ---- stage 1: find a live port that "responds" (200/401/403) ----
     # Ports are probed concurrently and then judged in the order the user asked
     # for them, so the winner never depends on which answer came back first.
-    results = await _probe_ports(ip, s)
+    results = await _probe_ports(ip, s, deadline)
     live: RTSPClient = None
     vendor = "Generic"
     open_port = None  # (client, vendor) for a passwordless confirmed stream
     winner = -1
-    for index, (state, client, port_vendor) in enumerate(results):
+    for index, state, client, port_vendor in results:
         if state == "open":
             winner, open_port = index, (client, port_vendor or "Generic")
             break
@@ -513,7 +544,7 @@ async def _handle_host(ip: str, s: Settings, stats: dict = None) -> list:
             )
         client.close()
     # Release the sockets of the ports that lost the race.
-    for index, (_state, client, _vendor) in enumerate(results):
+    for index, _state, client, _vendor in results:
         if index != winner:
             client.close()
 
@@ -523,6 +554,9 @@ async def _handle_host(ip: str, s: Settings, stats: dict = None) -> list:
         return found
 
     if live is None:
+        # Port probing may already have consumed the whole host budget.
+        if deadline is not None and loop.time() >= deadline:
+            return found
         # No live RTSP port.  In 'cve'/'combined' mode, fall back to probing
         # the configured HTTP/HTTPS ports for CVE exploits on the device's web
         # panel (e.g. Hikvision/Dahua config disclosure, RCE endpoints).
@@ -545,16 +579,13 @@ async def _handle_host(ip: str, s: Settings, stats: dict = None) -> list:
                 )
 
             for found_here in await asyncio.gather(
-                *(_probe_http(hp) for hp in s.http_ports)
+                *(_probe_http(hp) for hp in s.http_ports),
+                return_exceptions=True,
             ):
+                if isinstance(found_here, BaseException):
+                    continue
                 found.extend(found_here or ())
         return found
-
-    # A pathological camera (accepts the port but stalls mid-brute) must not
-    # occupy its host slot for ~one timeout per credential.  Enforce a
-    # wall-clock budget and give up early on repeated transport failures.
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + s.host_timeout if s.host_timeout > 0 else None
 
     # ---- stage 2: find a route that works without credentials ----
     # Sweep the FULL route list without credentials.
@@ -579,6 +610,10 @@ async def _handle_host(ip: str, s: Settings, stats: dict = None) -> list:
         return found
 
     # ---- stage 2.5: ONVIF stream discovery ----
+    if deadline is not None and loop.time() >= deadline:
+        live.close()
+        return found
+
     # Only reached when the cheap RTSP route sweep came up empty, so the fast
     # path (a camera that answers "/" straight away) pays nothing for it.  ONVIF
     # runs over HTTP on its own port and needs no guessing, so a device found
@@ -613,6 +648,9 @@ async def _handle_host(ip: str, s: Settings, stats: dict = None) -> list:
             return found
 
     # ---- stage 3: CVE exploits (vendor-specific backdoors & HTTP probes) ----
+    if deadline is not None and loop.time() >= deadline:
+        live.close()
+        return found
     # "Generic" is no longer excluded: the CVE database ships a shared
     # factory-default credential list for unidentified devices, and the vendor-
     # specific http_probe entries are harmless to try against any web panel.
@@ -769,6 +807,13 @@ async def _screenshot_worker(queue: asyncio.Queue, s: Settings, counter: dict):
             queue.task_done()
 
 
+def _install_screenshot_executor(workers: int) -> None:
+    """Size the loop's thread pool to the capture concurrency."""
+    from CamReaper.screenshot import install_executor
+
+    install_executor(workers)
+
+
 async def run(iter_targets, s: Settings, on_counter=None, on_status=None) -> dict:
     """Drive the whole scan.  ``iter_targets`` is an async iterator of IPs.
     Returns a stats dict.
@@ -783,6 +828,20 @@ async def run(iter_targets, s: Settings, on_counter=None, on_status=None) -> dic
     without it the watchdog prints one line per tick.
     """
     sem = asyncio.Semaphore(s.host_concurrency)
+    # Global pacing and TLS-port configuration are process-wide; apply them at
+    # the start of every run so one scan cannot leak into the next.
+    ratelimit.configure(s.rate_limit)
+    # Always reset the TLS-port set: an embedded caller that runs a second scan
+    # with different Settings must not inherit the first scan's ports.
+    from CamReaper.cve import configure_https_ports
+
+    configure_https_ports(s.https_ports)
+    # Screenshots block a worker thread while the child process runs.  The
+    # default executor is capped at min(32, cpu+4) threads, so asking for more
+    # than that many capture workers used to queue silently behind 32 threads.
+    # A dedicated executor sized to --screenshot-concurrency removes the cap.
+    if s.enable_screenshots and s.screenshot_concurrency > 0:
+        _install_screenshot_executor(s.screenshot_concurrency)
     # Bounded: hosts hand their capture to the workers and wait when the queue
     # is full, so a fast scan cannot pile up frames faster than they are shot.
     result_queue: asyncio.Queue = asyncio.Queue(
@@ -798,6 +857,7 @@ async def run(iter_targets, s: Settings, on_counter=None, on_status=None) -> dic
         "ports": {},  # port -> count of confirmed streams
         "cve_found": 0,  # streams found via CVE exploits
         "cve_tested": 0,  # CVE exploits tested
+        "onvif_found": 0,  # streams discovered through ONVIF
         "http_checked": 0,  # HTTP ports probed for CVE exploits
         "http_found": 0,  # HTTP ports with matched CVE exploits
         "errors": 0,  # hosts that raised instead of being classified
@@ -826,7 +886,17 @@ async def run(iter_targets, s: Settings, on_counter=None, on_status=None) -> dic
                             await record_http_cve(ip, f.port, f.cve_id)
                         else:
                             stats["found"] += 1
-                            await record_url(f.url())
+                            url = f.url()
+                            await record_url(url)
+                            await record_finding(
+                                ip=f.ip,
+                                port=f.port,
+                                route=f.route,
+                                credentials=f.credentials,
+                                vendor=f.vendor,
+                                url=url,
+                                cve_id=f.cve_id,
+                            )
                             await result_queue.put(f)
                             vendors = stats["vendors"]
                             vendors[f.vendor] = vendors.get(f.vendor, 0) + 1
@@ -867,6 +937,13 @@ async def run(iter_targets, s: Settings, on_counter=None, on_status=None) -> dic
                     oldest = f"{longest} ({(now - inflight[longest]):.0f}s)"
                 else:
                     oldest = "-"
+                rate = stats["checked"] / elapsed if elapsed > 0 else 0.0
+                total = s.expected_total
+                eta = None
+                remaining = 0
+                if total and total > stats["checked"] and rate > 0:
+                    remaining = total - stats["checked"]
+                    eta = remaining / rate
                 info = {
                     "elapsed": elapsed,
                     "checked": stats["checked"],
@@ -874,16 +951,23 @@ async def run(iter_targets, s: Settings, on_counter=None, on_status=None) -> dic
                     "screenshots": stats["screenshots"],
                     "inflight": len(inflight),
                     "oldest": oldest,
+                    "rate": rate,
+                    "total": total,
+                    "remaining": remaining,
+                    "eta": eta,
                 }
                 if on_status is not None:
                     on_status(info)
                 else:
+                    eta_text = f"{eta:.0f}s" if eta is not None else "-"
                     print(
                         f"[worker] elapsed={info['elapsed']:.0f}s "
                         f"checked={green(info['checked'])} "
+                        f"rate={rate:.1f}/s "
                         f"found={green(info['found'])} "
                         f"screenshots={green(info['screenshots'])} "
-                        f"inflight={info['inflight']} oldest={oldest}"
+                        f"inflight={info['inflight']} eta={eta_text} "
+                        f"oldest={oldest}"
                     )
         except asyncio.CancelledError:
             raise

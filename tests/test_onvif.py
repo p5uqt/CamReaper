@@ -65,6 +65,11 @@ def test_extract_profiles_dedupes_and_keeps_order():
     assert _extract_profiles(xml) == ["MainStream", "SubStream"]
 
 
+def test_extract_profiles_accepts_single_quoted_attributes():
+    xml = "<tt:Profiles token='ch1' fixed='true'/>"
+    assert _extract_profiles(xml) == ["ch1"]
+
+
 def test_extract_uri_from_stream_setup():
     body = (
         "<trt:GetStreamUriResponse><trt:MediaUri>"

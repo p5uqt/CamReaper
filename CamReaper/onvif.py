@@ -63,9 +63,12 @@ DEVICE_ENDPOINTS = (
 )
 
 # Elements carry the ONVIF namespace, but firmware is inconsistent about
-# declaring it, so both prefixed and unprefixed tags are accepted.
+# declaring it, so both prefixed and unprefixed tags are accepted.  Attribute
+# quotes are matched in both styles: XML allows single quotes and some firmware
+# actually uses them.
 _TOKEN_RE = re.compile(
-    rb"<(?:[A-Za-z0-9_.-]+:)?Profiles\b[^>]*?\btoken=\"([^\"]+)\"", re.IGNORECASE
+    rb"<(?:[A-Za-z0-9_.-]+:)?Profiles\b[^>]*?\btoken\s*=\s*([\"'])(.*?)\1",
+    re.IGNORECASE | re.DOTALL,
 )
 _URI_RE = re.compile(
     rb"<(?:[A-Za-z0-9_.-]+:)?Uri\b[^>]*>(.*?)</(?:[A-Za-z0-9_.-]+:)?Uri>",
@@ -201,10 +204,11 @@ def _basic_auth(user: str, password: str) -> str:
 def _parse_digest_challenge(value: str) -> dict:
     """Parse a ``WWW-Authenticate: Digest ...`` challenge into a params dict."""
     params = {}
-    _, _, rest = value.partition("Digest")
+    match = re.search(r"digest\b", value, re.IGNORECASE)
+    rest = value[match.end():] if match else value
     for part in re.findall(r'(\w+)\s*=\s*(?:"([^"]*)"|([^,\s]+))', rest):
         key, quoted, bare = part
-        params[key.lower()] = quoted or bare
+        params[key.lower()] = quoted or bare or ""
     return params
 
 
@@ -217,19 +221,19 @@ def _digest_response(
     algorithm = params.get("algorithm", "MD5").upper()
     qop_raw = params.get("qop", "")
     qop = ""
-    # qop may be a comma separated list; auth-int cannot be satisfied with a
-    # password hash, so pick the first supported token.
+    # qop may be a comma separated list.  ``auth-int`` needs the entity body
+    # hash (which this helper does not have), so only plain ``auth`` is usable;
+    # claiming auth for an auth-int-only server would produce a rejected hash.
     for token in qop_raw.split(","):
-        token = token.strip().lower()
-        if token in ("auth", "auth-int"):
+        if token.strip().lower() == "auth":
             qop = "auth"
             break
     cnonce = base64.b64encode(os.urandom(8)).decode()
     nc = "00000001"
 
     # Each algorithm maps to a function returning a lowercase hex digest.
-    # SHA-512-256 is SHA-512 truncated to 32 bytes, which hashlib has no
-    # dedicated constructor for.
+    # SHA-512-256 has its own IV (it is NOT a truncated SHA-512), so it must
+    # come from hashlib's implementation when one is available.
     def _md5(data: bytes) -> str:
         return hashlib.md5(data).hexdigest()
 
@@ -237,7 +241,10 @@ def _digest_response(
         return hashlib.sha256(data).hexdigest()
 
     def _sha512_256(data: bytes) -> str:
-        return hashlib.sha512(data).hexdigest()[:64]
+        try:
+            return hashlib.new("sha512_256", data).hexdigest()
+        except (ValueError, TypeError):  # old/limited OpenSSL build
+            return hashlib.sha512(data).hexdigest()[:64]
 
     hashers = {
         "MD5": _md5,
@@ -245,12 +252,16 @@ def _digest_response(
         "SHA-256": _sha256,
         "SHA-256-SESS": _sha256,
         "SHA-512-256": _sha512_256,
+        "SHA-512-256-SESS": _sha512_256,
     }
     h = hashers.get(algorithm, _md5)
 
     # HA1/HA2/response are all colon-separated field lists, not a plain
     # concatenation, so each one is joined explicitly.
     ha1 = h(f"{user}:{realm}:{password}".encode())
+    if algorithm.endswith("-SESS"):
+        # RFC 7616: the session variant re-hashes HA1 with nonce and cnonce.
+        ha1 = h(f"{ha1}:{nonce}:{cnonce}".encode())
     ha2 = h(f"{method}:{uri}".encode())
     if qop:
         response = h(f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}".encode())
@@ -322,7 +333,7 @@ def _extract_profiles(body: str) -> list:
     """
     seen = []
     for match in _TOKEN_RE.finditer(body.encode("utf-8", errors="replace")):
-        token = match.group(1).decode("utf-8", errors="replace").strip()
+        token = match.group(2).decode("utf-8", errors="replace").strip()
         if token and token not in seen:
             seen.append(token)
     return seen
@@ -596,6 +607,10 @@ async def discover(
                 for t in tasks:
                     if not t.done():
                         t.cancel()
+                # Reap cancelled/finished tasks so their sockets are closed
+                # before the caller moves on (and no "never retrieved" warning
+                # is emitted on a long scan).
+                await asyncio.gather(*tasks, return_exceptions=True)
                 return res
     except Exception:
         pass

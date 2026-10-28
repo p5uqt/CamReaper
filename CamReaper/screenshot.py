@@ -98,6 +98,35 @@ def _do_capture(url: str, out_dir: str, timeout: float) -> str:
     return path
 
 
+def install_executor(workers: int) -> None:
+    """Size the running loop's default executor for screenshot work.
+
+    ``capture`` hands the blocking subprocess lifecycle to
+    ``run_in_executor(None, ...)``, i.e. the loop's default executor, whose
+    default thread count is ``min(32, cpu_count + 4)``.  With more capture
+    workers than that, the surplus silently queued behind 32 threads, so
+    ``--screenshot-concurrency`` stopped having any effect.  Installing an
+    executor sized to the requested concurrency removes that hidden cap.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    workers = max(1, int(workers))
+    try:
+        loop.set_default_executor(
+            ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="CamReaper-shot"
+            )
+        )
+    except (RuntimeError, ValueError):
+        # The executor may already be shut down (loop teardown) - the default
+        # is still correct, just not widened.
+        pass
+
+
 async def capture(url: str, out_dir: str, timeout: float = 10.0) -> str:
     """Capture one screenshot; returns absolute path or empty string.
 

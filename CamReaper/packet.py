@@ -21,7 +21,8 @@ def _digest_auth(option, ip, port, path, credentials, realm, nonce):
     # partition (not split): a credential line without ":" must still produce a
     # request instead of raising ValueError and aborting the whole scan.
     username, _, password = credentials.partition(":")
-    uri = f"rtsp://{ip}:{port}{path}"
+    host = f"[{ip}]" if ":" in str(ip) and not str(ip).startswith("[") else ip
+    uri = f"rtsp://{host}:{port}{path}"
     ha1 = _ha1(username, realm, password)
     ha2 = hashlib.md5(f"{option}:{uri}".encode("utf-8")).hexdigest()
     response = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode("utf-8")).hexdigest()
@@ -40,6 +41,7 @@ def describe(ip, port, path, cseq, credentials, realm=None, nonce=None) -> str:
 
     `credentials == ":"` means "no credentials" → no Authorization header.
     """
+    host = f"[{ip}]" if ":" in str(ip) and not str(ip).startswith("[") else ip
     if credentials == ":":
         auth = ""
     elif realm:
@@ -50,7 +52,7 @@ def describe(ip, port, path, cseq, credentials, realm=None, nonce=None) -> str:
         auth = f"{_basic_auth(credentials)}\r\n"
 
     return (
-        f"DESCRIBE rtsp://{ip}:{port}{path} RTSP/1.0\r\n"
+        f"DESCRIBE rtsp://{host}:{port}{path} RTSP/1.0\r\n"
         f"CSeq: {cseq}\r\n"
         f"{auth}"
         "User-Agent: Mozilla/5.0\r\n"

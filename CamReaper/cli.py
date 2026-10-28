@@ -200,11 +200,33 @@ class PortList(argparse.Action):
         setattr(namespace, self.dest, ports)
 
 
-def positive_int(value: Any):
+def non_negative_int(value: Any):
     n = int(value)
-    if n < 1:
-        raise argparse.ArgumentTypeError(f"{value} must be >= 1")
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"{value} must be >= 0")
     return n
+
+
+def shard_arg(value: Any) -> tuple:
+    """Parse ``--shard INDEX/TOTAL`` into a 0-based ``(index, total)`` pair."""
+    text = str(value).strip()
+    left, sep, right = text.partition("/")
+    if not sep:
+        raise argparse.ArgumentTypeError(
+            f"{value} must look like INDEX/TOTAL (e.g. 1/4)"
+        )
+    try:
+        index = int(left)
+        total = int(right)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{value} must look like INDEX/TOTAL (e.g. 1/4)"
+        ) from None
+    if total < 1 or index < 1 or index > total:
+        raise argparse.ArgumentTypeError(
+            f"{value}: need 1 <= INDEX <= TOTAL"
+        )
+    return index - 1, total
 
 
 _DESCRIPTION = """\
@@ -281,6 +303,54 @@ target_group.add_argument(
     metavar="FILE",
     help="credential list to try ('user:pass' per line)",
 )
+target_group.add_argument(
+    "--exclude",
+    action="append",
+    type=target_arg,
+    default=None,
+    metavar="SPEC",
+    help=(
+        "skip targets matching this file/CIDR/range/IP. Repeatable, so several "
+        "networks can be excluded; matching is done after --dedup and before "
+        "--shard"
+    ),
+)
+target_group.add_argument(
+    "--shard",
+    type=shard_arg,
+    default=None,
+    metavar="INDEX/TOTAL",
+    help=(
+        "scan only one deterministic slice of the target stream, e.g. 2/4. "
+        "Shards are disjoint, so the same range can be split across several "
+        "machines or processes without coordination"
+    ),
+)
+target_group.add_argument(
+    "--skip",
+    default=0,
+    type=non_negative_int,
+    metavar="N",
+    help=(
+        "skip the first N targets of this run (after --shard). Useful for "
+        "resuming a chunked scan without a checkpoint"
+    ),
+)
+target_group.add_argument(
+    "--limit",
+    default=0,
+    type=non_negative_int,
+    metavar="N",
+    help="stop after N targets of this run (0 = no limit)",
+)
+target_group.add_argument(
+    "--count-only",
+    action="store_true",
+    help=(
+        "print the number of targets this run would scan and exit without "
+        "touching the network (the count is arithmetic, so a /8 is instant)"
+    ),
+)
 
 # -- exploits: CVE and ONVIF --------------------------------------------------
 exploit_group = parser.add_argument_group("exploits: CVE and ONVIF")
@@ -317,6 +387,17 @@ exploit_group.add_argument(
     type=float,
     metavar="S",
     help="socket timeout for CVE HTTP probes; lower it for hosts that swallow packets",
+)
+exploit_group.add_argument(
+    "--https-ports",
+    nargs="+",
+    default=[443, 8443],
+    action=PortList,
+    metavar="PORTS",
+    help=(
+        "ports from --http-ports that must be probed over TLS. Ranges allowed; "
+        "add a non-standard HTTPS panel port here if its plain-HTTP probe fails"
+    ),
 )
 exploit_group.add_argument(
     "--no-http",
@@ -424,6 +505,17 @@ perf_group.add_argument(
     help=(
         "cap credential attempts per host per second (0 = no limit). Slows "
         "brute-force against one host to dodge lockouts"
+    ),
+)
+perf_group.add_argument(
+    "--rate-limit",
+    default=0.0,
+    type=float,
+    metavar="N",
+    help=(
+        "global cap on NEW connections per second across the whole scan "
+        "(0 = no limit). Unlike --attempts-per-sec this paces all hosts "
+        "together, so a wide scan does not saturate the uplink or trip an IDS"
     ),
 )
 perf_group.add_argument(
