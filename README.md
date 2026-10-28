@@ -85,7 +85,7 @@ CamReaper [OPTIONS]
 
 | Profile | What it changes |
 |---------|-----------------|
-| `fast` (default) | Pre-profile behaviour: the original 11 routes / 11 credentials, **no ONVIF**, **no deep-auth**, only the first responsive port, old `404` rules, no per-host budget. This is what runs when `--profile` is omitted. |
+| `fast` (default) | Pre-profile behaviour: the original 11 routes / 11 credentials, **no ONVIF**, **no deep-auth**, processes only the first responsive port, old `404` rules, no per-host budget. This is what runs when `--profile` is omitted. |
 | `balanced` | ONVIF + deep-auth + every responsive port + the expanded built-in wordlists (36 routes / 52 credentials) + a 60s host budget. |
 | `max` | Balanced plus the community lists from `routecreds/` (830+ routes, 200+ credentials), common camera ports when `-p` is not given, `--mode combined`, 16 port probes/pipelines at once and a 300s host budget. Slowest, but finds the most. |
 

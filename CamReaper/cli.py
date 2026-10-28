@@ -1,5 +1,8 @@
 import argparse
+import os
 import shutil
+import sys
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -32,27 +35,216 @@ def _terminal_width(default: int = 100) -> int:
 
 
 class CustomHelpFormatter(argparse.RawDescriptionHelpFormatter):
-    """Wider option column, and an epilog that keeps its own line breaks.
-
-    ``RawDescriptionHelpFormatter`` only preserves line breaks in the
-    description/epilog; everything else is still wrapped, which is what we want
-    for the long per-option explanations.
-    """
+    """Formatter primitives used by the custom ``--help`` renderer."""
 
     def __init__(self, prog):
-        super().__init__(
-            prog, max_help_position=32, width=_terminal_width()
-        )
+        super().__init__(prog, max_help_position=32, width=_terminal_width())
 
     def _format_action_invocation(self, action):
-        # Same as the base class, except that the option strings are joined with
-        # ", " on one line instead of argparse's default (which puts each
-        # spelling on its own line and makes "-t, --targets SPEC" three rows).
+        # Keep both spellings on one line, and use compact metavars:
+        #   -p, --ports PORTS...        instead of  PORTS [PORTS ...]
+        #   --failed-file [PATH]        instead of  [PATH]
         if not action.option_strings or action.nargs == 0:
-            return super()._format_action_invocation(action)
-        default = self._get_default_metavar_for_optional(action)
-        args_string = self._format_args(action, default)
+            return ", ".join(action.option_strings) or action.dest
+        if action.metavar is not None:
+            metavar = action.metavar
+        elif action.choices is not None:
+            metavar = "{" + ",".join(map(str, action.choices)) + "}"
+        else:
+            metavar = action.dest.upper()
+        if action.nargs == "?":
+            args_string = f"[{metavar}]"
+        elif action.nargs == "+":
+            args_string = f"{metavar}..."
+        elif action.nargs == "*":
+            args_string = f"[{metavar}...]"
+        else:
+            args_string = self._format_args(action, metavar)
         return ", ".join(action.option_strings) + " " + args_string
+
+
+# --- human-friendly help -----------------------------------------------------
+
+_STYLES = {
+    "bold": "\033[1m",
+    "cyan": "\033[36m",
+    "green": "\033[32m",
+    "dim": "\033[2m",
+}
+
+
+def _use_color() -> bool:
+    """ANSI colors on a real terminal, unless the user opted out."""
+    if os.environ.get("NO_COLOR") or os.environ.get("TERM") == "dumb":
+        return False
+    try:
+        return sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+def _paint(text: str, *styles: str) -> str:
+    if not _use_color() or not styles:
+        return text
+    prefix = "".join(_STYLES.get(style, "") for style in styles)
+    return f"{prefix}{text}\033[0m"
+
+
+def _wrap(text: str, width: int) -> list:
+    return textwrap.wrap(
+        text,
+        width=max(20, width),
+        break_long_words=False,
+        break_on_hyphens=False,
+    ) or [""]
+
+
+_PROFILE_SUMMARY = (
+    (
+        "fast",
+        "Old speed: 11 routes / 11 credentials, no ONVIF/deep-auth, "
+        "processes only the first responsive port. (default)",
+    ),
+    (
+        "balanced",
+        "ONVIF + deep-auth + every responsive port + 36 routes / "
+        "52 credentials.",
+    ),
+    (
+        "max",
+        "Community lists + common camera ports + CVE mode + a long "
+        "per-host budget.",
+    ),
+)
+
+_GROUP_SUBTITLES = {
+    "scan profile": "choose the speed / coverage trade-off",
+    "targets and wordlists": "what to scan and which lists to use",
+    "exploits: CVE and ONVIF": "backdoor credentials, web probes and ONVIF discovery",
+    "pacing and robustness": "concurrency, timeouts and pacing",
+    "screenshots and gallery": "capture frames and build the HTML gallery",
+    "extra output files": "optional diagnostic logs",
+    "checkpoint and resume": "save and continue long scans",
+}
+
+_GROUP_ORDER = (
+    "options",
+    "scan profile",
+    "targets and wordlists",
+    "exploits: CVE and ONVIF",
+    "pacing and robustness",
+    "screenshots and gallery",
+    "extra output files",
+    "checkpoint and resume",
+)
+
+
+def _render_usage(width: int) -> list:
+    lines = [_paint("USAGE", "bold", "cyan")]
+    for line in (
+        "CamReaper -t TARGETS [OPTIONS]",
+        "CamReaper --capture RESULT.txt",
+        "CamReaper --gallery-html URLS.txt",
+        "CamReaper --count-only -t TARGETS",
+    ):
+        lines.extend("  " + part for part in _wrap(line, width - 2))
+    lines.append("")
+    return lines
+
+
+def _render_profiles(width: int) -> list:
+    lines = [_paint("PROFILES", "bold", "cyan")]
+    label_width = 10
+    for name, description in _PROFILE_SUMMARY:
+        plain_prefix = f"  {name:<{label_width}} "
+        prefix = "  " + _paint(f"{name:<{label_width}}", "cyan") + " "
+        wrapped = _wrap(description, width - len(plain_prefix))
+        lines.append(prefix + wrapped[0])
+        lines.extend(" " * len(plain_prefix) + part for part in wrapped[1:])
+    lines.append(
+        "  " + _paint("switch with --profile NAME", "dim")
+    )
+    lines.append("")
+    return lines
+
+
+def _render_option(action, formatter, width: int) -> list:
+    label = formatter._format_action_invocation(action)
+    help_text = (action.help or "").strip()
+    if not help_text:
+        return ["  " + _paint(label, "cyan")]
+
+    desc_col = 32
+    label_width = len(label) + 2
+    if label_width + 2 <= desc_col:
+        prefix = "  " + _paint(label, "cyan") + " " * (desc_col - label_width)
+        body_width = width - desc_col
+        body = _wrap(help_text, body_width)
+        lines = [prefix + body[0]]
+        lines.extend(" " * desc_col + part for part in body[1:])
+        return lines
+
+    # Long option names get their own line; the description starts below.
+    lines = ["  " + _paint(label, "cyan")]
+    lines.extend(
+        " " * desc_col + part
+        for part in _wrap(help_text, width - desc_col)
+    )
+    return lines
+
+
+def _render_group(group, formatter, width: int) -> list:
+    actions = [a for a in group._group_actions if a.help is not argparse.SUPPRESS]
+    if not actions:
+        return []
+
+    title = "general" if group.title == "options" else group.title
+    lines = [_paint(f"[ {title} ]", "bold", "cyan")]
+    subtitle = (
+        "show this help and version"
+        if group.title == "options"
+        else _GROUP_SUBTITLES.get(group.title)
+    )
+    if subtitle:
+        lines.extend("  " + part for part in _wrap(subtitle, width - 2))
+    for action in actions:
+        lines.extend(_render_option(action, formatter, width))
+    lines.append("")
+    return lines
+
+
+def _render_help(parser) -> str:
+    width = _terminal_width()
+    formatter = CustomHelpFormatter(parser.prog)
+    lines: list = []
+
+    title = f"{parser.prog} {__version__}"
+    lines.append(_paint(title, "bold", "cyan"))
+    description = " ".join((parser.description or "").split())
+    lines.extend(
+        "  " + _paint(line, "dim")
+        for line in _wrap(description, width - 2)
+    )
+    lines.append("")
+    lines.extend(_render_usage(width))
+    lines.extend(_render_profiles(width))
+
+    groups = {group.title: group for group in parser._action_groups}
+    for group_title in _GROUP_ORDER:
+        group = groups.get(group_title)
+        if group is not None:
+            lines.extend(_render_group(group, formatter, width))
+
+    # The epilog is a hand-formatted examples cheat-sheet: keep its line
+    # breaks exactly as authored (the tests and the README rely on them).
+    if parser.epilog:
+        epilog_lines = parser.epilog.splitlines()
+        for index, line in enumerate(epilog_lines):
+            if index == 0:
+                lines.append(_paint(line, "bold", "cyan"))
+            else:
+                lines.append(line)
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _render_default(value: Any) -> str:
@@ -99,7 +291,7 @@ class _HelpGroup(argparse._ArgumentGroup):
 
 
 class HelpParser(argparse.ArgumentParser):
-    """``ArgumentParser`` that appends each option's default to its help text."""
+    """``ArgumentParser`` with defaults in help and a custom, readable layout."""
 
     def add_argument(self, *args, **kwargs):
         return super().add_argument(*args, **_with_default(kwargs))
@@ -108,6 +300,12 @@ class HelpParser(argparse.ArgumentParser):
         group = _HelpGroup(self, *args, **kwargs)
         self._action_groups.append(group)
         return group
+
+    def format_help(self) -> str:
+        return _render_help(self)
+
+    def format_usage(self) -> str:
+        return f"usage: {self.prog} -t TARGETS [OPTIONS]\n"
 
 
 def file_path(value: Any):
@@ -242,9 +440,8 @@ def shard_arg(value: Any) -> tuple:
 
 
 _DESCRIPTION = """\
-Brute-force camera credentials, run known exploits, ask ONVIF devices for
-their stream URL, and build a screenshot gallery. Options are grouped below;
-every option states its own default."""
+RTSP camera scanner: route discovery, credentials, ONVIF, known CVE checks
+and a screenshot gallery."""
 
 _EPILOG = """\
 examples:
@@ -282,11 +479,9 @@ profile_group.add_argument(
     choices=("fast", "balanced", "max"),
     default="fast",
     help=(
-        "'fast' = pre-profile speed: small wordlists, no ONVIF, no deep-auth, "
-        "first responsive port only; 'balanced' = fast plus ONVIF/deep-auth "
-        "and all ports; 'max' = balanced plus the community wordlists, common "
-        "camera ports, CVE mode and a larger per-host budget. Explicit flags "
-        "still override the profile where noted"
+        "speed/coverage preset: fast (old speed), balanced (ONVIF + deep-auth "
+        "+ all ports) or max (community lists, CVE mode, common ports). See "
+        "PROFILES above; explicit flags still override the profile"
     ),
 )
 
@@ -311,7 +506,8 @@ target_group.add_argument(
     metavar="PORTS",
     help=(
         "RTSP ports, ranges allowed ('554 8554' or '8000-8008'). Cameras and "
-        "DVRs commonly listen on 554 plus 8554/5554/10554/8000/6800"
+        "DVRs commonly listen on 554 plus 8554/5554/10554/8000/6800. "
+        "The max profile adds common camera ports when -p is omitted"
     ),
 )
 target_group.add_argument(
@@ -320,7 +516,10 @@ target_group.add_argument(
     type=file_path,
     default=DEFAULT_ROUTES,
     metavar="FILE",
-    help="route list to probe (one path per line)",
+    help=(
+        "route list to probe (one path per line). The profile chooses the "
+        "default list: fast 11, balanced 36, max the community list"
+    ),
 )
 target_group.add_argument(
     "-c",
@@ -328,7 +527,10 @@ target_group.add_argument(
     type=file_path,
     default=DEFAULT_CREDENTIALS,
     metavar="FILE",
-    help="credential list to try ('user:pass' per line)",
+    help=(
+        "credential list to try ('user:pass' per line). The profile chooses "
+        "the default list: fast 11, balanced 52, max the community list"
+    ),
 )
 target_group.add_argument(
     "--exclude",
@@ -388,7 +590,8 @@ exploit_group.add_argument(
     action=ModeAction,
     help=(
         "'brute' = credentials only, 'cve' = exploits only, 'combined' = "
-        "exploits first, then brute-force for hosts still unfound"
+        "exploits first, then brute-force for hosts still unfound. The max "
+        "profile uses 'combined' when --mode is omitted"
     ),
 )
 exploit_group.add_argument(
@@ -437,16 +640,16 @@ exploit_group.add_argument(
     action="store_true",
     help=(
         "ask each host for its stream URL over ONVIF (SOAP GetProfiles / "
-        "GetStreamUri). ONVIF is on by default; this flag is kept for "
-        "compatibility and explicitness"
+        "GetStreamUri). On in balanced/max, off in fast; this flag enables "
+        "it explicitly in fast"
     ),
 )
 exploit_group.add_argument(
     "--no-onvif",
     action="store_true",
     help=(
-        "disable ONVIF discovery (default is on). Use it for very large or "
-        "latency-sensitive scans"
+        "disable ONVIF discovery (on in balanced/max, off in fast). Use it "
+        "for very large or latency-sensitive scans"
     ),
 )
 exploit_group.add_argument(
@@ -475,7 +678,8 @@ exploit_group.add_argument(
     metavar="N",
     help=(
         "ONVIF profiles per device to resolve into RTSP URLs. Each one costs a "
-        "GetStreamUri call, and a 64-channel NVR answers with dozens of tokens"
+        "GetStreamUri call, and a 64-channel NVR answers with dozens of tokens. "
+        "The max profile uses 8"
     ),
 )
 

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-__version__ = "4.3.1"
+__version__ = "4.4.0"
 # Balanced/max defaults (the larger curated lists).
 DEFAULT_ROUTES = Path(__file__).parent / "defroutes"
 DEFAULT_CREDENTIALS = Path(__file__).parent / "defcreds"

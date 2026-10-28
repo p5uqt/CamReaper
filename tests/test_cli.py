@@ -453,3 +453,55 @@ def test_main_wires_fast_profile_into_settings(monkeypatch, tmp_path):
     assert settings.host_timeout == 0.0
     assert len(settings.routes) == 11
     assert len(settings.credentials) == 11
+
+
+# --- help design -------------------------------------------------------------
+
+
+def test_help_has_modern_header_and_sections():
+    from CamReaper import __version__
+
+    text = parser.format_help()
+    assert text.startswith(f"CamReaper {__version__}\n")
+    for section in ("USAGE", "PROFILES", "[ general ]", "[ targets and wordlists ]"):
+        assert section in text
+
+
+def test_help_has_a_profile_cheat_sheet():
+    text = parser.format_help()
+    assert "Old speed" in text
+    assert "every responsive port" in text
+    assert "Community lists" in text
+    assert "switch with --profile NAME" in text
+
+
+def test_help_uses_compact_metavars():
+    text = parser.format_help()
+    assert "-p, --ports PORTS..." in text
+    assert "--http-ports PORTS..." in text
+    assert "PORTS [PORTS ...]" not in text
+
+
+def test_help_colors_option_names_on_a_tty(monkeypatch):
+    import CamReaper.cli as cli
+
+    monkeypatch.setattr(cli, "_use_color", lambda: True)
+    text = parser.format_help()
+    assert "\033[36m" in text  # cyan option/label colour
+    assert "\033[0m" in text
+
+
+def test_help_wraps_on_a_narrow_terminal(monkeypatch):
+    from unittest import mock
+    import CamReaper.cli as cli
+
+    monkeypatch.setattr(
+        cli.shutil,
+        "get_terminal_size",
+        lambda fallback=(100, 24): mock.Mock(columns=72),
+    )
+    width = cli._terminal_width()
+    text = parser.format_help()
+    assert width == 70
+    too_long = [line for line in text.splitlines() if len(line) > width]
+    assert too_long == []
